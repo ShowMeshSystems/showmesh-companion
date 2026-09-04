@@ -1,6 +1,6 @@
 # ShowMesh Companion
 
-ShowMesh Companion is a small, cross-platform desktop host for capabilities that must run on an endpoint beside show software or an LTC consumer. It keeps configuration in its own settings UI and advertises only the modules that are enabled and configured.
+ShowMesh Companion is a small, cross-platform desktop host for capabilities that must run on an endpoint beside show software or an LTC consumer. It keeps configuration in its own settings UI and will advertise only modules that are enabled, configured, and proven operational.
 
 The current repository is a **foundation build**. It provides the desktop shell, persistent settings, capability derivation, Show Night arming policy, temporary overrides, and an honest status surface. Process observation/relaunch, audio capture/LTC decoding, coordinator transport, login registration, signing, and installers are not operational yet.
 

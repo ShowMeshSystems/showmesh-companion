@@ -91,12 +91,30 @@ impl SettingsStore {
     pub fn load(&self) -> Result<AppSettings, String> {
         let path = self.directory.join("settings.json");
         match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(settings) => Ok(settings),
+                Err(_) => self.recover_invalid(&path),
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(AppSettings::default())
             }
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    fn recover_invalid(&self, path: &std::path::Path) -> Result<AppSettings, String> {
+        let backup = self.directory.join("settings.json.previous");
+        if let Ok(bytes) = fs::read(&backup)
+            && let Ok(settings) = serde_json::from_slice(&bytes)
+        {
+            return Ok(settings);
+        }
+        let invalid = self.directory.join("settings.json.invalid");
+        if invalid.exists() {
+            fs::remove_file(&invalid).map_err(|error| error.to_string())?;
+        }
+        fs::rename(path, invalid).map_err(|error| error.to_string())?;
+        Ok(AppSettings::default())
     }
 
     pub fn save(&self, settings: &AppSettings) -> Result<(), String> {

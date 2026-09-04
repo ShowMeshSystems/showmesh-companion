@@ -51,7 +51,7 @@ function render(): void {
   const settings = draft ?? snapshot.settings;
   const capabilities = snapshot.capabilities.length
     ? snapshot.capabilities.map((capability) => `<li><span>${escapeHtml(capability.id)}</span><small>v${capability.version}</small></li>`).join("")
-    : '<li class="empty">No capabilities will be advertised until a module is configured.</li>';
+    : '<li class="empty">No capability candidates exist until a module is configured.</li>';
 
   app.innerHTML = `
     <header class="app-header">
@@ -115,7 +115,7 @@ function render(): void {
       </section>
 
       <section class="section capability-section">
-        <div class="section-heading"><div><p class="eyebrow">Advertisement preview</p><h2>Capabilities</h2></div><p>Runtime probes will become an additional gate before these are sent to ShowMesh.</p></div>
+        <div class="section-heading"><div><p class="eyebrow">Configuration preview</p><h2>Capability candidates</h2></div><p>These are not advertised. A successful runtime probe and controller connection will be required first.</p></div>
         <ul class="capabilities">${capabilities}</ul>
       </section>
 

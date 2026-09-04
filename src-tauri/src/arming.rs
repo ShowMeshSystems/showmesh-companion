@@ -81,6 +81,31 @@ pub fn resolve(
     }
 }
 
+#[allow(dead_code)]
+pub fn expire_override(
+    previous: NightSessionState,
+    next: NightSessionState,
+    value: ArmingOverride,
+) -> ArmingOverride {
+    match value {
+        ArmingOverride::ArmUntilNightEnds
+            if matches!(
+                next,
+                NightSessionState::Inactive | NightSessionState::Stopped
+            ) =>
+        {
+            ArmingOverride::None
+        }
+        ArmingOverride::DisarmUntilNextNight
+            if matches!(next, NightSessionState::Preparing)
+                && !matches!(previous, NightSessionState::Preparing) =>
+        {
+            ArmingOverride::None
+        }
+        _ => value,
+    }
+}
+
 fn decision(armed: bool, reason: &str) -> ArmingDecision {
     ArmingDecision {
         armed,
@@ -157,6 +182,26 @@ mod tests {
                 ArmingOverride::ArmUntilNightEnds
             )
             .armed
+        );
+    }
+
+    #[test]
+    fn temporary_overrides_expire_at_night_boundaries() {
+        assert_eq!(
+            expire_override(
+                NightSessionState::FadingOut,
+                NightSessionState::Stopped,
+                ArmingOverride::ArmUntilNightEnds
+            ),
+            ArmingOverride::None
+        );
+        assert_eq!(
+            expire_override(
+                NightSessionState::Inactive,
+                NightSessionState::Preparing,
+                ArmingOverride::DisarmUntilNextNight
+            ),
+            ArmingOverride::None
         );
     }
 }

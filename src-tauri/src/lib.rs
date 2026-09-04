@@ -23,7 +23,7 @@ struct AppState {
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot {
     settings: AppSettings,
-    capabilities: Vec<capabilities::AdvertisedCapability>,
+    capabilities: Vec<capabilities::CapabilityCandidate>,
     night_state: NightSessionState,
     arming_override: ArmingOverride,
     effective_armed: bool,

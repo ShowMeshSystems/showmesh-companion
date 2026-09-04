@@ -11,7 +11,7 @@ Modules implement independent observation concerns:
 - `process.supervise` observes a configured local process and, when armed, may launch it if absent. It never kills or forcibly restarts the application.
 - `timecode.ltc.observe` captures and decodes LTC from a configured local audio input. It reports input evidence only, not application-consumption evidence.
 
-Capability advertisement is derived from valid module configuration and will later also require a successful runtime probe. Disabled, incomplete, unavailable, and unobserved states must not be collapsed into one state.
+The foundation derives capability candidates from complete configuration. Actual advertisement will also require a successful runtime probe and controller connection. Disabled, incomplete, unavailable, and unobserved states must not be collapsed into one state.
 
 ## Arming
 
