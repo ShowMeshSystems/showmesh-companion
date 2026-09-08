@@ -32,7 +32,8 @@
     "shortDescription": "Local supervision and timecode evidence for ShowMesh",
     "longDescription": "ShowMesh Companion supervises local show applications and reports direct timecode evidence without entering the real-time media path.",
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "entitlements": "Entitlements.plist"
     },
     "icon": [
       "icons/32x32.png",
