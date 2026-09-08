@@ -81,7 +81,6 @@ pub fn resolve(
     }
 }
 
-#[allow(dead_code)]
 pub fn expire_override(
     previous: NightSessionState,
     next: NightSessionState,

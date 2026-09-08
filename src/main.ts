@@ -20,6 +20,7 @@ interface Snapshot {
   effectiveArmed: boolean;
   armingReason: string;
   supervisor: { state: string; reason: string; operational: boolean };
+  timecode: { state: string; reason: string; operational: boolean };
 }
 
 function requireAppRoot(): HTMLElement {
@@ -68,6 +69,7 @@ function render(): void {
     <section class="status-band" aria-label="Current state">
       <div><span>Show Night</span><strong>${escapeHtml(snapshot.nightState)}</strong></div>
       <div><span>Process monitor</span><strong>${snapshot.supervisor.operational ? "Observing" : "Not observing"}</strong></div>
+      <div><span>LTC</span><strong>${escapeHtml(snapshot.timecode.state)}</strong></div>
       <div><span>Controller</span><strong>${settings.coordinatorUrl ? "Configured" : "Not configured"}</strong></div>
       <p>${escapeHtml(snapshot.armingReason)}</p>
     </section>
@@ -95,6 +97,7 @@ function render(): void {
           <button type="button" class="button secondary" data-override="disarm-until-next-night">Disarm until next night</button>
           <button type="button" class="button ghost" data-override="none">Clear</button>
         </div>
+        <p class="module-notice">Foundation only: override expiry depends on Show Night state, which has not been observed yet.</p>
       </section>
 
       <section class="section modules">
