@@ -272,13 +272,9 @@ impl BuildError {
 fn find_device(device_id: &str) -> Option<cpal::Device> {
     let host = cpal::default_host();
     let devices = host.input_devices().ok()?;
-    devices.into_iter().find(|device| {
-        device
-            .description()
-            .map(|description| description.name().to_string())
-            .unwrap_or_default()
-            == device_id
-    })
+    devices
+        .into_iter()
+        .find(|device| device.name().unwrap_or_default() == device_id)
 }
 
 struct CallbackState {
@@ -364,12 +360,12 @@ fn build_stream(
     }
     let sample_format = supported.sample_format();
     let config = supported.config();
-    let sample_rate = config.sample_rate;
+    let sample_rate = config.sample_rate.0;
     let channel_index = (target.channel - 1) as usize;
     let channels_usize = channels as usize;
 
     let error_shared = Arc::clone(&shared);
-    let error_callback = move |_error: cpal::Error| {
+    let error_callback = move |_error: cpal::StreamError| {
         error_shared.publish_error(
             "The audio input stream reported an error, possibly because the device was disconnected.",
         );
@@ -380,7 +376,7 @@ fn build_stream(
             let mut state = CallbackState::new(channel_index, channels_usize, sample_rate, shared);
             device
                 .build_input_stream_raw(
-                    config,
+                    &config,
                     sample_format,
                     move |data, _info| {
                         if let Some(samples) = data.as_slice::<f32>() {
@@ -396,7 +392,7 @@ fn build_stream(
             let mut state = CallbackState::new(channel_index, channels_usize, sample_rate, shared);
             device
                 .build_input_stream_raw(
-                    config,
+                    &config,
                     sample_format,
                     move |data, _info| {
                         if let Some(samples) = data.as_slice::<i16>() {
@@ -412,7 +408,7 @@ fn build_stream(
             let mut state = CallbackState::new(channel_index, channels_usize, sample_rate, shared);
             device
                 .build_input_stream_raw(
-                    config,
+                    &config,
                     sample_format,
                     move |data, _info| {
                         if let Some(samples) = data.as_slice::<u16>() {

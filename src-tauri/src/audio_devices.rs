@@ -89,15 +89,14 @@ fn enumerate() -> Vec<AudioInputDevice> {
 
 fn describe(device: cpal::Device) -> AudioInputDevice {
     let name = device
-        .description()
-        .map(|description| description.name().to_string())
+        .name()
         .unwrap_or_else(|_| "Unknown audio input device".into());
     match device.default_input_config() {
         Ok(config) => AudioInputDevice {
             id: name.clone(),
             name,
             channels: Some(config.channels()),
-            default_sample_rate: Some(config.sample_rate()),
+            default_sample_rate: Some(config.sample_rate().0),
             config_known: true,
         },
         Err(_) => AudioInputDevice {
