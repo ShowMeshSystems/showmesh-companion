@@ -1,4 +1,5 @@
 mod arming;
+mod audio_devices;
 mod capabilities;
 mod settings;
 mod state;
@@ -6,10 +7,11 @@ mod supervisor;
 mod timecode;
 mod tray;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arming::{ArmingOverride, NightSessionState};
+use audio_devices::AudioInputDevice;
 use serde::Serialize;
 use settings::{AppSettings, SettingsStore};
 use state::StateStore;
@@ -19,6 +21,7 @@ use tauri::{AppHandle, Manager, State};
 use timecode::TimecodeStatus;
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 struct AppState {
     settings: Mutex<AppSettings>,
@@ -29,6 +32,7 @@ struct AppState {
     supervisor: Mutex<SupervisorStatus>,
     supervision_runtime: Mutex<SupervisionState>,
     tray_handles: Mutex<Option<tray::TrayHandles>>,
+    device_cache: Arc<audio_devices::DeviceCache>,
 }
 
 #[derive(Serialize)]
@@ -70,7 +74,10 @@ impl AppState {
             .lock()
             .map_err(|_| "supervisor lock is poisoned")?
             .clone();
-        let timecode = TimecodeStatus::from_settings(&settings.timecode);
+        let timecode = TimecodeStatus::from_settings(
+            &settings.timecode,
+            self.device_cache.devices().as_deref(),
+        );
 
         Ok(AppSnapshot {
             settings,
@@ -115,7 +122,10 @@ impl AppState {
             &runtime,
             Instant::now(),
         );
-        let timecode = TimecodeStatus::from_settings(&settings.timecode);
+        let timecode = TimecodeStatus::from_settings(
+            &settings.timecode,
+            self.device_cache.devices().as_deref(),
+        );
         self.refresh_tray(
             decision.armed,
             &decision.reason,
@@ -218,6 +228,11 @@ fn set_arming_override(
     state.apply_override(value)
 }
 
+#[tauri::command]
+fn list_audio_inputs(state: State<'_, AppState>) -> Vec<AudioInputDevice> {
+    state.device_cache.devices().unwrap_or_default()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -239,7 +254,14 @@ pub fn run() {
                 NightSessionState::Unknown,
                 arming_override,
             );
-            let initial_timecode = TimecodeStatus::from_settings(&settings.timecode);
+            let device_cache = Arc::new(audio_devices::DeviceCache::new());
+            let devices_ready =
+                audio_devices::spawn_refresh(Arc::clone(&device_cache), DEVICE_REFRESH_INTERVAL);
+            audio_devices::await_first_enumeration(&devices_ready);
+            let initial_timecode = TimecodeStatus::from_settings(
+                &settings.timecode,
+                device_cache.devices().as_deref(),
+            );
             let mut system = System::new();
             let (initial_status, initial_runtime) = supervisor::tick(
                 &settings.resolume,
@@ -257,6 +279,7 @@ pub fn run() {
                 supervisor: Mutex::new(initial_status.clone()),
                 supervision_runtime: Mutex::new(initial_runtime),
                 tray_handles: Mutex::new(None),
+                device_cache,
             });
 
             #[cfg(target_os = "macos")]
@@ -301,7 +324,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             save_settings,
-            set_arming_override
+            set_arming_override,
+            list_audio_inputs
         ])
         .run(tauri::generate_context!())
         .expect("error while running showmesh-companion");
@@ -329,6 +353,7 @@ mod tests {
             supervisor: Mutex::new(SupervisorStatus::not_configured()),
             supervision_runtime: Mutex::new(SupervisionState::default()),
             tray_handles: Mutex::new(None),
+            device_cache: Arc::new(audio_devices::DeviceCache::new()),
         }
     }
 

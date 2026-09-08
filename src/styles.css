@@ -66,7 +66,7 @@ form { display: grid; gap: 16px; }
 .field-grid.compact { grid-template-columns: 1fr 120px; }
 label:not(.check, .switch, .segmented label) { display: grid; gap: 8px; }
 label > span { font-weight: 600; }
-input[type="text"], input[type="url"], input[type="number"], input:not([type]) { width: 100%; height: 40px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); background: var(--surface-raised); }
+input[type="text"], input[type="url"], input[type="number"], input:not([type]), select { width: 100%; height: 40px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); background: var(--surface-raised); }
 input::placeholder { color: var(--text-muted); opacity: .75; }
 .check { display: flex; align-items: start; gap: 12px; margin-top: 20px; }
 .check span { display: grid; }
@@ -92,6 +92,7 @@ input::placeholder { color: var(--text-muted); opacity: .75; }
 .switch input:checked + span::after { transform: translateX(14px); }
 .switch input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 2px; }
 .module-notice { margin: 12px 0 0; padding: 12px; border-radius: var(--radius); color: var(--warning-text); background: var(--warning-bg); font-size: 12px; }
+.device-actions { margin-top: 12px; }
 .detail-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px 16px; margin: 12px 0 0; padding: 0; }
 .detail-grid div { display: grid; gap: 2px; }
 .detail-grid dt { margin: 0; color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }

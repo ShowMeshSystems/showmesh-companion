@@ -12,6 +12,14 @@ interface Settings {
   timecode: { enabled: boolean; deviceId: string; channel: number };
 }
 
+interface AudioInputDevice {
+  id: string;
+  name: string;
+  channels: number | null;
+  defaultSampleRate: number | null;
+  configKnown: boolean;
+}
+
 interface Snapshot {
   settings: Settings;
   capabilities: Array<{ id: string; version: number }>;
@@ -42,6 +50,9 @@ let snapshot: Snapshot | null = null;
 let draft: Settings | null = null;
 let error: string | null = null;
 let saving = false;
+let audioDevices: AudioInputDevice[] = [];
+let audioDevicesError: string | null = null;
+let audioDevicesLoading = false;
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (character) => ({
@@ -123,9 +134,13 @@ function render(): void {
         <article class="module">
           <div class="module-title"><div><h3>LTC observation</h3><p>Decode timecode received on this computer without claiming an application consumed it.</p></div><label class="switch"><input name="timecodeEnabled" type="checkbox" ${settings.timecode.enabled ? "checked" : ""}/><span aria-hidden="true"></span><b>Enabled</b></label></div>
           <div class="field-grid compact">
-            <label><span>Audio input</span><input name="deviceId" placeholder="Device discovery is not implemented yet" value="${escapeHtml(settings.timecode.deviceId)}" /></label>
-            <label><span>Channel</span><input name="channel" type="number" min="1" value="${settings.timecode.channel}" /></label>
+            <label><span>Audio input</span><select name="deviceId">${deviceOptions(audioDevices, settings.timecode.deviceId)}</select></label>
+            <label><span>Channel</span><input name="channel" type="number" min="1" ${selectedDeviceChannelMax(audioDevices, settings.timecode.deviceId)} value="${settings.timecode.channel}" /></label>
           </div>
+          <div class="device-actions">
+            <button type="button" class="button secondary" id="refresh-devices" ${audioDevicesLoading ? "disabled" : ""}>${audioDevicesLoading ? "Refreshing…" : "Refresh device list"}</button>
+          </div>
+          ${audioDevicesError ? `<p class="form-error" role="alert">${escapeHtml(audioDevicesError)}</p>` : ""}
           <p class="module-notice">${escapeHtml(snapshot.timecode.reason)}</p>
         </article>
       </section>
@@ -143,6 +158,55 @@ function render(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-override]").forEach((button) => {
     button.addEventListener("click", () => setOverride(button.dataset.override as ArmingOverride));
   });
+  document
+    .querySelector<HTMLSelectElement>('select[name="deviceId"]')
+    ?.addEventListener("change", handleDeviceChange);
+  document
+    .querySelector<HTMLButtonElement>("#refresh-devices")
+    ?.addEventListener("click", () => void loadAudioDevices());
+}
+
+function handleDeviceChange(event: Event): void {
+  const select = event.currentTarget as HTMLSelectElement;
+  const device = audioDevices.find((candidate) => candidate.id === select.value);
+  const channelInput = document.querySelector<HTMLInputElement>('input[name="channel"]');
+  if (!channelInput) return;
+  if (device?.channels) {
+    channelInput.max = String(device.channels);
+  } else {
+    channelInput.removeAttribute("max");
+  }
+}
+
+function deviceOptions(devices: AudioInputDevice[], selectedId: string): string {
+  const known = devices.some((device) => device.id === selectedId);
+  const options: string[] = [];
+  if (!selectedId) {
+    options.push('<option value="" selected>Choose an audio input…</option>');
+  } else if (!known) {
+    options.push(
+      `<option value="${escapeHtml(selectedId)}" selected>${escapeHtml(selectedId)} (not currently available)</option>`,
+    );
+  }
+  for (const device of devices) {
+    const detail = !device.configKnown
+      ? " — configuration unavailable"
+      : device.channels !== null
+        ? ` — ${device.channels} channel${device.channels === 1 ? "" : "s"}`
+        : "";
+    options.push(
+      `<option value="${escapeHtml(device.id)}" ${device.id === selectedId ? "selected" : ""}>${escapeHtml(device.name)}${detail}</option>`,
+    );
+  }
+  if (!options.length) {
+    options.push('<option value="">No audio input devices were found.</option>');
+  }
+  return options.join("");
+}
+
+function selectedDeviceChannelMax(devices: AudioInputDevice[], selectedId: string): string {
+  const device = devices.find((candidate) => candidate.id === selectedId);
+  return device?.channels ? `max="${device.channels}"` : "";
 }
 
 function policyOption(value: ArmingPolicy, label: string, selected: ArmingPolicy): string {
@@ -157,6 +221,19 @@ async function load(): Promise<void> {
   } catch (cause) {
     error = String(cause);
   }
+  render();
+}
+
+async function loadAudioDevices(): Promise<void> {
+  audioDevicesLoading = true;
+  render();
+  try {
+    audioDevices = await invoke<AudioInputDevice[]>("list_audio_inputs");
+    audioDevicesError = null;
+  } catch (cause) {
+    audioDevicesError = String(cause);
+  }
+  audioDevicesLoading = false;
   render();
 }
 
@@ -197,3 +274,4 @@ async function setOverride(value: ArmingOverride): Promise<void> {
 }
 
 void load();
+void loadAudioDevices();
