@@ -8,6 +8,8 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use crate::settings::ResolumeSettings;
 
 const GRACE_WINDOW: Duration = Duration::from_secs(20);
+const STABILITY_WINDOW: Duration = Duration::from_secs(60);
+const MIN_SPAWN_INTERVAL: Duration = Duration::from_secs(10);
 const INITIAL_BACKOFF_SECS: u64 = 2;
 const MAX_BACKOFF_SECS: u64 = 60;
 
@@ -72,6 +74,7 @@ impl SupervisorStatus {
 enum Phase {
     Idle,
     Launching { since: Instant },
+    Running { since: Instant },
     Backoff { until: Instant },
 }
 
@@ -79,6 +82,7 @@ enum Phase {
 pub struct SupervisionState {
     consecutive_failures: u32,
     last_error: Option<String>,
+    last_spawn_at: Option<Instant>,
     phase: Phase,
 }
 
@@ -87,6 +91,7 @@ impl Default for SupervisionState {
         Self {
             consecutive_failures: 0,
             last_error: None,
+            last_spawn_at: None,
             phase: Phase::Idle,
         }
     }
@@ -107,6 +112,7 @@ pub enum SupervisionAction {
     Spawn,
     AwaitGraceWindow,
     AwaitBackoff,
+    AwaitSpawnInterval,
 }
 
 fn next_backoff(consecutive_failures: u32) -> Duration {
@@ -115,23 +121,37 @@ fn next_backoff(consecutive_failures: u32) -> Duration {
     Duration::from_secs(secs.min(MAX_BACKOFF_SECS))
 }
 
-fn status_present(matched: ProcessMatch) -> SupervisorStatus {
-    let reason = match matched {
-        ProcessMatch::MatchedByPath => {
-            "A process running at the configured application path was observed.".to_string()
-        }
-        ProcessMatch::MatchedByName => {
-            "No process matched the configured application path, but a process with the same name was observed.".to_string()
-        }
+fn status_present(matched: ProcessMatch, state: &SupervisionState) -> SupervisorStatus {
+    let (reason, operational) = match matched {
+        ProcessMatch::MatchedByPath => (
+            "A process running at the configured application path was observed.".to_string(),
+            true,
+        ),
+        ProcessMatch::MatchedByName => (
+            "No process matched the configured application path, but a process with the same name was observed. No launch will be attempted while that process exists.".to_string(),
+            false,
+        ),
         ProcessMatch::NotMatched => unreachable!("status_present requires a match"),
     };
     SupervisorStatus {
         state: SupervisorState::Present,
         reason,
-        operational: true,
-        consecutive_failures: 0,
-        last_error: None,
+        operational,
+        consecutive_failures: state.consecutive_failures,
+        last_error: state.last_error.clone(),
         matched_by: matched,
+    }
+}
+
+fn status_awaiting_spawn_interval(state: &SupervisionState) -> SupervisorStatus {
+    SupervisorStatus {
+        state: SupervisorState::Backoff,
+        reason: "A launch was attempted very recently. Waiting before attempting another."
+            .to_string(),
+        operational: false,
+        consecutive_failures: state.consecutive_failures,
+        last_error: state.last_error.clone(),
+        matched_by: ProcessMatch::NotMatched,
     }
 }
 
@@ -200,24 +220,26 @@ fn status_backoff(state: &SupervisionState) -> SupervisorStatus {
 fn decide_from_idle(
     input: &SupervisionInput,
     state: &SupervisionState,
+    now: Instant,
 ) -> (SupervisionAction, SupervisionState, SupervisorStatus) {
+    let next_state = SupervisionState {
+        consecutive_failures: state.consecutive_failures,
+        last_error: state.last_error.clone(),
+        last_spawn_at: state.last_spawn_at,
+        phase: Phase::Idle,
+    };
     if !input.armed {
-        let next_state = SupervisionState {
-            consecutive_failures: state.consecutive_failures,
-            last_error: state.last_error.clone(),
-            phase: Phase::Idle,
-        };
         let status = status_absent_disarmed(&next_state);
-        (SupervisionAction::DoNothing, next_state, status)
-    } else {
-        let next_state = SupervisionState {
-            consecutive_failures: state.consecutive_failures,
-            last_error: state.last_error.clone(),
-            phase: Phase::Idle,
-        };
-        let status = status_absent_armed(&next_state);
-        (SupervisionAction::Spawn, next_state, status)
+        return (SupervisionAction::DoNothing, next_state, status);
     }
+    if let Some(last_spawn_at) = state.last_spawn_at
+        && now.saturating_duration_since(last_spawn_at) < MIN_SPAWN_INTERVAL
+    {
+        let status = status_awaiting_spawn_interval(&next_state);
+        return (SupervisionAction::AwaitSpawnInterval, next_state, status);
+    }
+    let status = status_absent_armed(&next_state);
+    (SupervisionAction::Spawn, next_state, status)
 }
 
 pub fn decide(
@@ -256,12 +278,29 @@ pub fn decide(
     }
 
     if input.matched != ProcessMatch::NotMatched {
-        let next_state = SupervisionState::default();
-        return (
-            SupervisionAction::DoNothing,
-            next_state,
-            status_present(input.matched),
-        );
+        let running_since = match state.phase {
+            Phase::Running { since } => since,
+            _ => now,
+        };
+        let stable = now.saturating_duration_since(running_since) >= STABILITY_WINDOW;
+        let next_state = SupervisionState {
+            consecutive_failures: if stable {
+                0
+            } else {
+                state.consecutive_failures
+            },
+            last_error: if stable {
+                None
+            } else {
+                state.last_error.clone()
+            },
+            last_spawn_at: state.last_spawn_at,
+            phase: Phase::Running {
+                since: running_since,
+            },
+        };
+        let status = status_present(input.matched, &next_state);
+        return (SupervisionAction::DoNothing, next_state, status);
     }
 
     match state.phase {
@@ -272,17 +311,24 @@ pub fn decide(
                 let status = status_launching(&next_state);
                 (SupervisionAction::AwaitGraceWindow, next_state, status)
             } else {
-                let failures = state.consecutive_failures + 1;
-                let backoff = next_backoff(failures);
-                let next_state = SupervisionState {
-                    consecutive_failures: failures,
-                    last_error: None,
-                    phase: Phase::Backoff {
-                        until: now + backoff,
-                    },
-                };
+                let next_state = failed_attempt(state, now, None);
                 let status = status_launch_failed(&next_state);
                 (SupervisionAction::AwaitBackoff, next_state, status)
+            }
+        }
+        Phase::Running { since } => {
+            if now.saturating_duration_since(since) < STABILITY_WINDOW {
+                let next_state = failed_attempt(state, now, None);
+                let status = status_launch_failed(&next_state);
+                (SupervisionAction::AwaitBackoff, next_state, status)
+            } else {
+                let recovered = SupervisionState {
+                    consecutive_failures: 0,
+                    last_error: None,
+                    last_spawn_at: state.last_spawn_at,
+                    phase: Phase::Idle,
+                };
+                decide_from_idle(input, &recovered, now)
             }
         }
         Phase::Backoff { until } => {
@@ -294,12 +340,29 @@ pub fn decide(
                 let idle_state = SupervisionState {
                     consecutive_failures: state.consecutive_failures,
                     last_error: state.last_error.clone(),
+                    last_spawn_at: state.last_spawn_at,
                     phase: Phase::Idle,
                 };
-                decide_from_idle(input, &idle_state)
+                decide_from_idle(input, &idle_state, now)
             }
         }
-        Phase::Idle => decide_from_idle(input, state),
+        Phase::Idle => decide_from_idle(input, state, now),
+    }
+}
+
+fn failed_attempt(
+    state: &SupervisionState,
+    now: Instant,
+    error: Option<String>,
+) -> SupervisionState {
+    let failures = state.consecutive_failures + 1;
+    SupervisionState {
+        consecutive_failures: failures,
+        last_error: error,
+        last_spawn_at: state.last_spawn_at,
+        phase: Phase::Backoff {
+            until: now + next_backoff(failures),
+        },
     }
 }
 
@@ -312,18 +375,15 @@ pub fn record_spawn_result(
         Ok(()) => SupervisionState {
             consecutive_failures: state.consecutive_failures,
             last_error: None,
+            last_spawn_at: Some(now),
             phase: Phase::Launching { since: now },
         },
         Err(error) => {
-            let failures = state.consecutive_failures + 1;
-            let backoff = next_backoff(failures);
-            SupervisionState {
-                consecutive_failures: failures,
-                last_error: Some(error),
-                phase: Phase::Backoff {
-                    until: now + backoff,
-                },
-            }
+            let attempted = SupervisionState {
+                last_spawn_at: Some(now),
+                ..state.clone()
+            };
+            failed_attempt(&attempted, now, Some(error))
         }
     }
 }
@@ -338,6 +398,7 @@ pub fn status_for(state: &SupervisionState) -> SupervisorStatus {
                 status_backoff(state)
             }
         }
+        Phase::Running { .. } => status_absent_armed(state),
         Phase::Idle => status_absent_armed(state),
     }
 }
@@ -440,7 +501,7 @@ fn observe(system: &mut System, configured_path: &Path) -> ProcessMatch {
     for process in system.processes().values() {
         let exe = process.exe();
         let name = process.name().to_string_lossy();
-        match match_process(configured_path, exe, &name, cfg!(windows)) {
+        match match_process(configured_path, exe, &name, true) {
             ProcessMatch::MatchedByPath => return ProcessMatch::MatchedByPath,
             ProcessMatch::MatchedByName => best = ProcessMatch::MatchedByName,
             ProcessMatch::NotMatched => {}
@@ -482,13 +543,14 @@ pub fn tick(
     if !settings.enabled {
         return (SupervisorStatus::disabled(), SupervisionState::default());
     }
-    if settings.application_path.trim().is_empty() {
+    let configured = settings.application_path.trim();
+    if configured.is_empty() {
         return (
             SupervisorStatus::not_configured(),
             SupervisionState::default(),
         );
     }
-    let configured_path = Path::new(&settings.application_path);
+    let configured_path = Path::new(configured);
     if !configured_path.exists() {
         return (
             SupervisorStatus {
@@ -500,7 +562,10 @@ pub fn tick(
                 last_error: None,
                 matched_by: ProcessMatch::NotMatched,
             },
-            SupervisionState::default(),
+            SupervisionState {
+                phase: Phase::Idle,
+                ..state.clone()
+            },
         );
     }
 
@@ -571,6 +636,7 @@ mod tests {
         let launching = SupervisionState {
             consecutive_failures: 0,
             last_error: None,
+            last_spawn_at: None,
             phase: Phase::Launching { since: t0 },
         };
         let t1 = t0 + Duration::from_secs(5);
@@ -587,6 +653,7 @@ mod tests {
         let launching = SupervisionState {
             consecutive_failures: 0,
             last_error: None,
+            last_spawn_at: None,
             phase: Phase::Launching { since: t0 },
         };
         let t1 = t0 + GRACE_WINDOW + Duration::from_secs(1);
@@ -610,11 +677,12 @@ mod tests {
     }
 
     #[test]
-    fn observing_the_process_resets_failure_count_and_backoff_to_zero() {
+    fn observing_the_process_starts_a_running_phase_without_clearing_failures() {
         let t0 = Instant::now();
         let backing_off = SupervisionState {
             consecutive_failures: 4,
             last_error: Some("previous failure".into()),
+            last_spawn_at: None,
             phase: Phase::Backoff {
                 until: t0 + Duration::from_secs(16),
             },
@@ -623,8 +691,168 @@ mod tests {
             decide(&input(ProcessMatch::MatchedByPath, true), &backing_off, t0);
         assert_eq!(action, SupervisionAction::DoNothing);
         assert_eq!(status.state, SupervisorState::Present);
+        assert_eq!(next_state.consecutive_failures, 4);
+        assert_eq!(next_state.phase, Phase::Running { since: t0 });
+    }
+
+    #[test]
+    fn a_process_that_stays_up_past_the_stability_window_clears_failures() {
+        let t0 = Instant::now();
+        let running = SupervisionState {
+            consecutive_failures: 4,
+            last_error: Some("previous failure".into()),
+            last_spawn_at: Some(t0),
+            phase: Phase::Running { since: t0 },
+        };
+        let (_, next_state, status) = decide(
+            &input(ProcessMatch::MatchedByPath, true),
+            &running,
+            t0 + STABILITY_WINDOW,
+        );
         assert_eq!(next_state.consecutive_failures, 0);
-        assert_eq!(next_state.phase, Phase::Idle);
+        assert!(next_state.last_error.is_none());
+        assert!(status.operational);
+    }
+
+    #[test]
+    fn a_process_that_vanishes_before_the_stability_window_counts_as_a_failure() {
+        let t0 = Instant::now();
+        let running = SupervisionState {
+            consecutive_failures: 0,
+            last_error: None,
+            last_spawn_at: Some(t0),
+            phase: Phase::Running { since: t0 },
+        };
+        let (action, next_state, status) = decide(
+            &input(ProcessMatch::NotMatched, true),
+            &running,
+            t0 + Duration::from_secs(6),
+        );
+        assert_eq!(action, SupervisionAction::AwaitBackoff);
+        assert_eq!(next_state.consecutive_failures, 1);
+        assert_eq!(status.state, SupervisorState::LaunchFailed);
+        assert!(matches!(next_state.phase, Phase::Backoff { .. }));
+    }
+
+    #[test]
+    fn a_crash_loop_escalates_backoff_instead_of_relaunching_every_poll() {
+        let t0 = Instant::now();
+        let mut state = SupervisionState::default();
+        let mut now = t0;
+        let mut spawns = 0;
+        let mut seen_backoffs = Vec::new();
+
+        for step in 0..150 {
+            let appears = match state.phase {
+                Phase::Running { .. } => step % 4 != 0,
+                Phase::Launching { .. } => true,
+                _ => false,
+            };
+            let matched = if appears {
+                ProcessMatch::MatchedByPath
+            } else {
+                ProcessMatch::NotMatched
+            };
+            let (action, next_state, _) = decide(&input(matched, true), &state, now);
+            state = next_state;
+            if action == SupervisionAction::Spawn {
+                spawns += 1;
+                state = record_spawn_result(&state, now, Ok(()));
+            }
+            if let Phase::Backoff { until } = state.phase {
+                seen_backoffs.push(until.saturating_duration_since(now));
+            }
+            now += Duration::from_secs(2);
+        }
+
+        assert!(
+            spawns <= 12,
+            "a crash loop must not relaunch on every poll, saw {spawns} spawns"
+        );
+        assert!(
+            seen_backoffs
+                .iter()
+                .any(|wait| *wait >= Duration::from_secs(32)),
+            "backoff must escalate across repeated failures"
+        );
+    }
+
+    #[test]
+    fn a_recent_spawn_blocks_another_launch_even_from_idle() {
+        let t0 = Instant::now();
+        let just_spawned = SupervisionState {
+            consecutive_failures: 0,
+            last_error: None,
+            last_spawn_at: Some(t0),
+            phase: Phase::Idle,
+        };
+        let (action, _, _) = decide(
+            &input(ProcessMatch::NotMatched, true),
+            &just_spawned,
+            t0 + Duration::from_secs(2),
+        );
+        assert_eq!(action, SupervisionAction::AwaitSpawnInterval);
+
+        let (action, _, _) = decide(
+            &input(ProcessMatch::NotMatched, true),
+            &just_spawned,
+            t0 + MIN_SPAWN_INTERVAL,
+        );
+        assert_eq!(action, SupervisionAction::Spawn);
+    }
+
+    #[test]
+    fn a_name_only_match_is_not_reported_as_operational() {
+        let t0 = Instant::now();
+        let (action, _, status) = decide(
+            &input(ProcessMatch::MatchedByName, true),
+            &SupervisionState::default(),
+            t0,
+        );
+        assert_eq!(action, SupervisionAction::DoNothing);
+        assert_eq!(status.state, SupervisorState::Present);
+        assert_eq!(status.matched_by, ProcessMatch::MatchedByName);
+        assert!(!status.operational);
+    }
+
+    #[test]
+    fn recording_a_spawn_result_tracks_the_attempt_time() {
+        let t0 = Instant::now();
+        let launched = record_spawn_result(&SupervisionState::default(), t0, Ok(()));
+        assert_eq!(launched.last_spawn_at, Some(t0));
+        assert_eq!(launched.consecutive_failures, 0);
+        assert!(launched.last_error.is_none());
+        assert_eq!(launched.phase, Phase::Launching { since: t0 });
+
+        let failed = record_spawn_result(
+            &SupervisionState::default(),
+            t0,
+            Err("open exited with 1.".into()),
+        );
+        assert_eq!(failed.last_spawn_at, Some(t0));
+        assert_eq!(failed.consecutive_failures, 1);
+        assert_eq!(failed.last_error.as_deref(), Some("open exited with 1."));
+        assert!(matches!(failed.phase, Phase::Backoff { .. }));
+    }
+
+    #[test]
+    fn a_transient_path_miss_does_not_discard_launch_history() {
+        let t0 = Instant::now();
+        let mut system = System::new();
+        let launching = SupervisionState {
+            consecutive_failures: 3,
+            last_error: None,
+            last_spawn_at: Some(t0),
+            phase: Phase::Launching { since: t0 },
+        };
+        let settings = ResolumeSettings {
+            enabled: true,
+            application_path: "/nonexistent/Arena.app".into(),
+        };
+        let (status, next_state) = tick(&settings, true, &mut system, &launching, t0);
+        assert_eq!(status.state, SupervisorState::PathMissing);
+        assert_eq!(next_state.consecutive_failures, 3);
+        assert_eq!(next_state.last_spawn_at, Some(t0));
     }
 
     #[test]
@@ -655,6 +883,7 @@ mod tests {
         let backing_off = SupervisionState {
             consecutive_failures: 2,
             last_error: None,
+            last_spawn_at: None,
             phase: Phase::Backoff {
                 until: t0 + Duration::from_secs(4),
             },
@@ -675,6 +904,7 @@ mod tests {
         let backing_off = SupervisionState {
             consecutive_failures: 3,
             last_error: Some("boom".into()),
+            last_spawn_at: None,
             phase: Phase::Backoff {
                 until: t0 + Duration::from_secs(4),
             },

@@ -4,6 +4,7 @@ mod settings;
 mod state;
 mod supervisor;
 mod timecode;
+mod tray;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ struct AppState {
     night_state: Mutex<NightSessionState>,
     supervisor: Mutex<SupervisorStatus>,
     supervision_runtime: Mutex<SupervisionState>,
+    tray_handles: Mutex<Option<tray::TrayHandles>>,
 }
 
 #[derive(Serialize)]
@@ -99,15 +101,27 @@ impl AppState {
         let arming_override = *override_guard;
         drop(override_guard);
         drop(night_guard);
-        let armed = arming::resolve(settings.arming_policy, night_state, arming_override).armed;
+        let decision = arming::resolve(settings.arming_policy, night_state, arming_override);
 
         let runtime = match self.supervision_runtime.lock() {
             Ok(guard) => guard.clone(),
             Err(_) => return,
         };
 
-        let (status, next_runtime) =
-            supervisor::tick(&settings.resolume, armed, system, &runtime, Instant::now());
+        let (status, next_runtime) = supervisor::tick(
+            &settings.resolume,
+            decision.armed,
+            system,
+            &runtime,
+            Instant::now(),
+        );
+        let timecode = TimecodeStatus::from_settings(&settings.timecode);
+        self.refresh_tray(
+            decision.armed,
+            &decision.reason,
+            &status.reason,
+            &timecode.reason,
+        );
 
         if let Ok(mut guard) = self.supervision_runtime.lock() {
             *guard = next_runtime;
@@ -115,6 +129,51 @@ impl AppState {
         if let Ok(mut guard) = self.supervisor.lock() {
             *guard = status;
         }
+    }
+
+    fn refresh_tray(
+        &self,
+        armed: bool,
+        arming_reason: &str,
+        supervisor_reason: &str,
+        timecode_reason: &str,
+    ) {
+        let Ok(guard) = self.tray_handles.lock() else {
+            return;
+        };
+        let Some(handles) = guard.as_ref() else {
+            return;
+        };
+        let _ = handles.armed_item.set_text(format!(
+            "{}: {arming_reason}",
+            if armed { "Armed" } else { "Disarmed" }
+        ));
+        let _ = handles
+            .supervisor_item
+            .set_text(format!("Resolume: {supervisor_reason}"));
+        let _ = handles
+            .timecode_item
+            .set_text(format!("LTC: {timecode_reason}"));
+    }
+
+    fn apply_override(&self, value: ArmingOverride) -> Result<AppSnapshot, String> {
+        let mut arming_override = self
+            .arming_override
+            .lock()
+            .map_err(|_| "arming-override lock is poisoned")?;
+        self.state_store
+            .save(value)
+            .map_err(|error| format!("Could not save the temporary override: {error}"))?;
+        *arming_override = value;
+        drop(arming_override);
+        let snapshot = self.snapshot()?;
+        self.refresh_tray(
+            snapshot.effective_armed,
+            &snapshot.arming_reason,
+            &snapshot.supervisor.reason,
+            &snapshot.timecode.reason,
+        );
+        Ok(snapshot)
     }
 
     #[allow(dead_code)]
@@ -129,12 +188,9 @@ impl AppState {
             .map_err(|_| "arming-override lock is poisoned")?;
         let previous = *night_state;
         let resolved_override = arming::expire_override(previous, next, *arming_override);
-        if resolved_override != *arming_override {
-            self.state_store.save(resolved_override)?;
-        }
         *night_state = next;
         *arming_override = resolved_override;
-        Ok(())
+        self.state_store.save(resolved_override)
     }
 }
 
@@ -159,17 +215,7 @@ fn set_arming_override(
     value: ArmingOverride,
     state: State<'_, AppState>,
 ) -> Result<AppSnapshot, String> {
-    let mut arming_override = state
-        .arming_override
-        .lock()
-        .map_err(|_| "arming-override lock is poisoned")?;
-    state
-        .state_store
-        .save(value)
-        .map_err(|error| format!("Could not save the temporary override: {error}"))?;
-    *arming_override = value;
-    drop(arming_override);
-    state.snapshot()
+    state.apply_override(value)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -188,16 +234,16 @@ pub fn run() {
             let arming_override = state_store
                 .load()
                 .map_err(|error| format!("could not load saved state: {error}"))?;
-            let armed = arming::resolve(
+            let decision = arming::resolve(
                 settings.arming_policy,
                 NightSessionState::Unknown,
                 arming_override,
-            )
-            .armed;
+            );
+            let initial_timecode = TimecodeStatus::from_settings(&settings.timecode);
             let mut system = System::new();
             let (initial_status, initial_runtime) = supervisor::tick(
                 &settings.resolume,
-                armed,
+                decision.armed,
                 &mut system,
                 &SupervisionState::default(),
                 Instant::now(),
@@ -208,9 +254,37 @@ pub fn run() {
                 state_store,
                 arming_override: Mutex::new(arming_override),
                 night_state: Mutex::new(NightSessionState::Unknown),
-                supervisor: Mutex::new(initial_status),
+                supervisor: Mutex::new(initial_status.clone()),
                 supervision_runtime: Mutex::new(initial_runtime),
+                tray_handles: Mutex::new(None),
             });
+
+            #[cfg(target_os = "macos")]
+            app.handle()
+                .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+
+            let tray_handles = tray::build(app.handle())?;
+            *app.state::<AppState>()
+                .tray_handles
+                .lock()
+                .map_err(|_| "tray lock is poisoned")? = Some(tray_handles);
+            app.state::<AppState>().refresh_tray(
+                decision.armed,
+                &decision.reason,
+                &initial_status.reason,
+                &initial_timecode.reason,
+            );
+
+            if let Some(window) = app.get_webview_window("main") {
+                let close_window = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = close_window.set_skip_taskbar(true);
+                        let _ = close_window.hide();
+                    }
+                });
+            }
 
             let handle: AppHandle = app.handle().clone();
             std::thread::spawn(move || {
@@ -254,6 +328,7 @@ mod tests {
             night_state: Mutex::new(NightSessionState::Unknown),
             supervisor: Mutex::new(SupervisorStatus::not_configured()),
             supervision_runtime: Mutex::new(SupervisionState::default()),
+            tray_handles: Mutex::new(None),
         }
     }
 
@@ -290,6 +365,10 @@ mod tests {
         state.apply_night_state(NightSessionState::Live).unwrap();
 
         assert_eq!(*state.night_state.lock().unwrap(), NightSessionState::Live);
+        assert_eq!(
+            state.state_store.load().unwrap(),
+            ArmingOverride::ArmUntilNightEnds
+        );
         assert_eq!(
             *state.arming_override.lock().unwrap(),
             ArmingOverride::ArmUntilNightEnds
