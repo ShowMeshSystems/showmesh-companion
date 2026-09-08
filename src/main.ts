@@ -19,7 +19,14 @@ interface Snapshot {
   armingOverride: ArmingOverride;
   effectiveArmed: boolean;
   armingReason: string;
-  supervisor: { state: string; reason: string; operational: boolean };
+  supervisor: {
+    state: string;
+    reason: string;
+    operational: boolean;
+    consecutiveFailures: number;
+    lastError: string | null;
+    matchedBy: string;
+  };
   timecode: { state: string; reason: string; operational: boolean };
 }
 
@@ -68,7 +75,7 @@ function render(): void {
 
     <section class="status-band" aria-label="Current state">
       <div><span>Show Night</span><strong>${escapeHtml(snapshot.nightState)}</strong></div>
-      <div><span>Process monitor</span><strong>${snapshot.supervisor.operational ? "Observing" : "Not observing"}</strong></div>
+      <div><span>Process monitor</span><strong>${escapeHtml(snapshot.supervisor.state)}</strong></div>
       <div><span>LTC</span><strong>${escapeHtml(snapshot.timecode.state)}</strong></div>
       <div><span>Controller</span><strong>${settings.coordinatorUrl ? "Configured" : "Not configured"}</strong></div>
       <p>${escapeHtml(snapshot.armingReason)}</p>
@@ -97,7 +104,7 @@ function render(): void {
           <button type="button" class="button secondary" data-override="disarm-until-next-night">Disarm until next night</button>
           <button type="button" class="button ghost" data-override="none">Clear</button>
         </div>
-        <p class="module-notice">Foundation only: override expiry depends on Show Night state, which has not been observed yet.</p>
+        <p class="module-notice">A temporary override is saved on this computer and stays in force after a restart. Expiry depends on Show Night state, which has not been observed yet, so an override only ends when it is cleared here.</p>
       </section>
 
       <section class="section modules">
@@ -105,7 +112,13 @@ function render(): void {
         <article class="module">
           <div class="module-title"><div><h3>Resolume supervision</h3><p>Observe Arena locally and launch it only when absent and armed.</p></div><label class="switch"><input name="resolumeEnabled" type="checkbox" ${settings.resolume.enabled ? "checked" : ""}/><span aria-hidden="true"></span><b>Enabled</b></label></div>
           <label><span>Resolume Arena application</span><input name="applicationPath" placeholder="/Applications/Resolume Arena/Arena.app" value="${escapeHtml(settings.resolume.applicationPath)}" /></label>
-          <p class="module-notice">Foundation only: process observation and launching are not operational in this build.</p>
+          <p class="module-notice">A running process is observed evidence only. It is not proof that Resolume is operating correctly.</p>
+          <dl class="detail-grid">
+            <div><dt>State</dt><dd>${escapeHtml(snapshot.supervisor.state)}</dd></div>
+            <div><dt>Matched by</dt><dd>${escapeHtml(snapshot.supervisor.matchedBy)}</dd></div>
+            <div><dt>Consecutive failures</dt><dd>${snapshot.supervisor.consecutiveFailures}</dd></div>
+            <div><dt>Last OS error</dt><dd>${snapshot.supervisor.lastError ? escapeHtml(snapshot.supervisor.lastError) : "None"}</dd></div>
+          </dl>
         </article>
         <article class="module">
           <div class="module-title"><div><h3>LTC observation</h3><p>Decode timecode received on this computer without claiming an application consumed it.</p></div><label class="switch"><input name="timecodeEnabled" type="checkbox" ${settings.timecode.enabled ? "checked" : ""}/><span aria-hidden="true"></span><b>Enabled</b></label></div>
@@ -113,7 +126,7 @@ function render(): void {
             <label><span>Audio input</span><input name="deviceId" placeholder="Device discovery is not implemented yet" value="${escapeHtml(settings.timecode.deviceId)}" /></label>
             <label><span>Channel</span><input name="channel" type="number" min="1" value="${settings.timecode.channel}" /></label>
           </div>
-          <p class="module-notice">Foundation only: audio capture and LTC decoding are not operational in this build.</p>
+          <p class="module-notice">${escapeHtml(snapshot.timecode.reason)}</p>
         </article>
       </section>
 

@@ -6,14 +6,18 @@ mod supervisor;
 mod timecode;
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use arming::{ArmingOverride, NightSessionState};
 use serde::Serialize;
 use settings::{AppSettings, SettingsStore};
 use state::StateStore;
-use supervisor::SupervisorStatus;
-use tauri::{Manager, State};
+use supervisor::{SupervisionState, SupervisorStatus};
+use sysinfo::System;
+use tauri::{AppHandle, Manager, State};
 use timecode::TimecodeStatus;
+
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 struct AppState {
     settings: Mutex<AppSettings>,
@@ -22,6 +26,7 @@ struct AppState {
     arming_override: Mutex<ArmingOverride>,
     night_state: Mutex<NightSessionState>,
     supervisor: Mutex<SupervisorStatus>,
+    supervision_runtime: Mutex<SupervisionState>,
 }
 
 #[derive(Serialize)]
@@ -44,14 +49,18 @@ impl AppState {
             .lock()
             .map_err(|_| "settings lock is poisoned")?
             .clone();
-        let night_state = *self
+        let night_guard = self
             .night_state
             .lock()
             .map_err(|_| "night-state lock is poisoned")?;
-        let arming_override = *self
+        let override_guard = self
             .arming_override
             .lock()
             .map_err(|_| "arming-override lock is poisoned")?;
+        let night_state = *night_guard;
+        let arming_override = *override_guard;
+        drop(override_guard);
+        drop(night_guard);
         let arming = arming::resolve(settings.arming_policy, night_state, arming_override);
         let capabilities = capabilities::derive(&settings);
         let supervisor = self
@@ -73,6 +82,41 @@ impl AppState {
         })
     }
 
+    fn poll_supervisor(&self, system: &mut System) {
+        let settings = match self.settings.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+        let night_guard = match self.night_state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let override_guard = match self.arming_override.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let night_state = *night_guard;
+        let arming_override = *override_guard;
+        drop(override_guard);
+        drop(night_guard);
+        let armed = arming::resolve(settings.arming_policy, night_state, arming_override).armed;
+
+        let runtime = match self.supervision_runtime.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+
+        let (status, next_runtime) =
+            supervisor::tick(&settings.resolume, armed, system, &runtime, Instant::now());
+
+        if let Ok(mut guard) = self.supervision_runtime.lock() {
+            *guard = next_runtime;
+        }
+        if let Ok(mut guard) = self.supervisor.lock() {
+            *guard = status;
+        }
+    }
+
     #[allow(dead_code)]
     fn apply_night_state(&self, next: NightSessionState) -> Result<(), String> {
         let mut night_state = self
@@ -85,12 +129,11 @@ impl AppState {
             .map_err(|_| "arming-override lock is poisoned")?;
         let previous = *night_state;
         let resolved_override = arming::expire_override(previous, next, *arming_override);
-        let override_changed = resolved_override != *arming_override;
-        *night_state = next;
-        *arming_override = resolved_override;
-        if override_changed {
+        if resolved_override != *arming_override {
             self.state_store.save(resolved_override)?;
         }
+        *night_state = next;
+        *arming_override = resolved_override;
         Ok(())
     }
 }
@@ -116,11 +159,16 @@ fn set_arming_override(
     value: ArmingOverride,
     state: State<'_, AppState>,
 ) -> Result<AppSnapshot, String> {
-    *state
+    let mut arming_override = state
         .arming_override
         .lock()
-        .map_err(|_| "arming-override lock is poisoned")? = value;
-    state.state_store.save(value)?;
+        .map_err(|_| "arming-override lock is poisoned")?;
+    state
+        .state_store
+        .save(value)
+        .map_err(|error| format!("Could not save the temporary override: {error}"))?;
+    *arming_override = value;
+    drop(arming_override);
     state.snapshot()
 }
 
@@ -137,15 +185,43 @@ pub fn run() {
                 .load()
                 .map_err(|error| format!("could not load settings: {error}"))?;
             let state_store = StateStore::new(config_dir);
-            let arming_override = state_store.load();
+            let arming_override = state_store
+                .load()
+                .map_err(|error| format!("could not load saved state: {error}"))?;
+            let armed = arming::resolve(
+                settings.arming_policy,
+                NightSessionState::Unknown,
+                arming_override,
+            )
+            .armed;
+            let mut system = System::new();
+            let (initial_status, initial_runtime) = supervisor::tick(
+                &settings.resolume,
+                armed,
+                &mut system,
+                &SupervisionState::default(),
+                Instant::now(),
+            );
             app.manage(AppState {
                 settings: Mutex::new(settings),
                 settings_store,
                 state_store,
                 arming_override: Mutex::new(arming_override),
                 night_state: Mutex::new(NightSessionState::Unknown),
-                supervisor: Mutex::new(SupervisorStatus::foundation()),
+                supervisor: Mutex::new(initial_status),
+                supervision_runtime: Mutex::new(initial_runtime),
             });
+
+            let handle: AppHandle = app.handle().clone();
+            std::thread::spawn(move || {
+                let mut system = system;
+                loop {
+                    std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
+                    let state = handle.state::<AppState>();
+                    state.poll_supervisor(&mut system);
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -176,13 +252,18 @@ mod tests {
             state_store: StateStore::new(dir),
             arming_override: Mutex::new(ArmingOverride::None),
             night_state: Mutex::new(NightSessionState::Unknown),
-            supervisor: Mutex::new(SupervisorStatus::foundation()),
+            supervisor: Mutex::new(SupervisorStatus::not_configured()),
+            supervision_runtime: Mutex::new(SupervisionState::default()),
         }
     }
 
     #[test]
     fn apply_night_state_expires_override_across_night_boundary() {
         let state = temp_state();
+        state
+            .state_store
+            .save(ArmingOverride::ArmUntilNightEnds)
+            .unwrap();
         *state.night_state.lock().unwrap() = NightSessionState::FadingOut;
         *state.arming_override.lock().unwrap() = ArmingOverride::ArmUntilNightEnds;
 
@@ -193,35 +274,29 @@ mod tests {
             NightSessionState::Stopped
         );
         assert_eq!(*state.arming_override.lock().unwrap(), ArmingOverride::None);
-        assert_eq!(state.state_store.load(), ArmingOverride::None);
+        assert_eq!(state.state_store.load().unwrap(), ArmingOverride::None);
     }
 
     #[test]
     fn apply_night_state_keeps_override_across_a_non_boundary_transition() {
         let state = temp_state();
+        state
+            .state_store
+            .save(ArmingOverride::ArmUntilNightEnds)
+            .unwrap();
         *state.night_state.lock().unwrap() = NightSessionState::Preshow;
         *state.arming_override.lock().unwrap() = ArmingOverride::ArmUntilNightEnds;
 
         state.apply_night_state(NightSessionState::Live).unwrap();
 
+        assert_eq!(*state.night_state.lock().unwrap(), NightSessionState::Live);
         assert_eq!(
             *state.arming_override.lock().unwrap(),
             ArmingOverride::ArmUntilNightEnds
         );
-    }
-
-    #[test]
-    fn persisted_override_round_trips_through_the_store() {
-        let state = temp_state();
-        *state.arming_override.lock().unwrap() = ArmingOverride::DisarmUntilNextNight;
-        state
-            .state_store
-            .save(ArmingOverride::DisarmUntilNextNight)
-            .unwrap();
-
         assert_eq!(
-            state.state_store.load(),
-            ArmingOverride::DisarmUntilNextNight
+            state.state_store.load().unwrap(),
+            ArmingOverride::ArmUntilNightEnds
         );
     }
 }

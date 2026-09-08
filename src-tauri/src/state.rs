@@ -19,14 +19,15 @@ impl StateStore {
         Self { directory }
     }
 
-    pub fn load(&self) -> ArmingOverride {
+    pub fn load(&self) -> Result<ArmingOverride, String> {
         let path = self.directory.join("state.json");
         match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<PersistedState>(&bytes) {
-                Ok(state) => state.arming_override,
-                Err(_) => self.recover_invalid(&path),
+                Ok(state) => Ok(state.arming_override),
+                Err(_) => Ok(self.recover_invalid(&path)),
             },
-            Err(_) => ArmingOverride::None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ArmingOverride::None),
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -93,7 +94,7 @@ mod tests {
     fn round_trips_the_persisted_override() {
         let store = StateStore::new(temp_dir());
         store.save(ArmingOverride::DisarmUntilNextNight).unwrap();
-        assert_eq!(store.load(), ArmingOverride::DisarmUntilNextNight);
+        assert_eq!(store.load().unwrap(), ArmingOverride::DisarmUntilNextNight);
     }
 
     #[test]
@@ -101,13 +102,36 @@ mod tests {
         let dir = temp_dir();
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("state.json"), b"not json").unwrap();
-        let store = StateStore::new(dir);
-        assert_eq!(store.load(), ArmingOverride::None);
+        let store = StateStore::new(dir.clone());
+        assert_eq!(store.load().unwrap(), ArmingOverride::None);
+        assert!(dir.join("state.json.invalid").exists());
     }
 
     #[test]
-    fn falls_back_to_none_when_the_state_file_is_missing() {
+    fn recovers_the_previous_state_when_the_current_file_is_corrupt() {
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("state.json.previous"),
+            br#"{"armingOverride":"disarm-until-next-night"}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("state.json"), b"not json").unwrap();
+        let store = StateStore::new(dir);
+        assert_eq!(store.load().unwrap(), ArmingOverride::DisarmUntilNextNight);
+    }
+
+    #[test]
+    fn reports_a_read_failure_instead_of_reporting_no_override() {
+        let dir = temp_dir();
+        fs::create_dir_all(dir.join("state.json")).unwrap();
+        let store = StateStore::new(dir);
+        assert!(store.load().is_err());
+    }
+
+    #[test]
+    fn treats_a_missing_state_file_as_no_override() {
         let store = StateStore::new(temp_dir());
-        assert_eq!(store.load(), ArmingOverride::None);
+        assert_eq!(store.load().unwrap(), ArmingOverride::None);
     }
 }

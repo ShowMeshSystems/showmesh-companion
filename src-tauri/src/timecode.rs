@@ -21,7 +21,7 @@ pub enum TimecodeState {
 #[serde(rename_all = "camelCase")]
 pub struct TimecodeStatus {
     pub state: TimecodeState,
-    pub reason: &'static str,
+    pub reason: String,
     pub operational: bool,
 }
 
@@ -29,7 +29,9 @@ impl TimecodeStatus {
     pub fn foundation() -> Self {
         Self {
             state: TimecodeState::NotStarted,
-            reason: "The timecode module is configured but LTC capture has not been implemented yet.",
+            reason:
+                "The timecode module is configured but LTC capture has not been implemented yet."
+                    .into(),
             operational: false,
         }
     }
@@ -37,7 +39,7 @@ impl TimecodeStatus {
     pub fn disabled() -> Self {
         Self {
             state: TimecodeState::Disabled,
-            reason: "LTC observation is disabled in settings.",
+            reason: "LTC observation is disabled in settings.".into(),
             operational: false,
         }
     }
@@ -45,7 +47,7 @@ impl TimecodeStatus {
     pub fn not_configured() -> Self {
         Self {
             state: TimecodeState::NotConfigured,
-            reason: "Choose an audio input before LTC observation can start.",
+            reason: "Choose an audio input before LTC observation can start.".into(),
             operational: false,
         }
     }
