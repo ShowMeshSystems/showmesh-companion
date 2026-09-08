@@ -82,7 +82,7 @@ impl Decoder {
                     self.nominal_half = Some(new_nominal);
                 }
             }
-        } else if ratio >= LONG_MIN_RATIO && ratio <= LONG_MAX_RATIO {
+        } else if (LONG_MIN_RATIO..=LONG_MAX_RATIO).contains(&ratio) {
             if self.pending_half.is_some() {
                 self.reset_frame_sync();
                 return;
@@ -172,14 +172,18 @@ fn bit_at(bits: u128, i: u32) -> u32 {
 }
 
 fn decode_payload(bits: u128, sample_index: u64) -> Option<Frame> {
-    let frame_units = bit_at(bits, 0) + bit_at(bits, 1) * 2 + bit_at(bits, 2) * 4 + bit_at(bits, 3) * 8;
+    let frame_units =
+        bit_at(bits, 0) + bit_at(bits, 1) * 2 + bit_at(bits, 2) * 4 + bit_at(bits, 3) * 8;
     let frame_tens = bit_at(bits, 8) + bit_at(bits, 9) * 2;
     let drop_frame = bit_at(bits, 10) != 0;
-    let sec_units = bit_at(bits, 16) + bit_at(bits, 17) * 2 + bit_at(bits, 18) * 4 + bit_at(bits, 19) * 8;
+    let sec_units =
+        bit_at(bits, 16) + bit_at(bits, 17) * 2 + bit_at(bits, 18) * 4 + bit_at(bits, 19) * 8;
     let sec_tens = bit_at(bits, 24) + bit_at(bits, 25) * 2 + bit_at(bits, 26) * 4;
-    let min_units = bit_at(bits, 32) + bit_at(bits, 33) * 2 + bit_at(bits, 34) * 4 + bit_at(bits, 35) * 8;
+    let min_units =
+        bit_at(bits, 32) + bit_at(bits, 33) * 2 + bit_at(bits, 34) * 4 + bit_at(bits, 35) * 8;
     let min_tens = bit_at(bits, 40) + bit_at(bits, 41) * 2 + bit_at(bits, 42) * 4;
-    let hour_units = bit_at(bits, 48) + bit_at(bits, 49) * 2 + bit_at(bits, 50) * 4 + bit_at(bits, 51) * 8;
+    let hour_units =
+        bit_at(bits, 48) + bit_at(bits, 49) * 2 + bit_at(bits, 50) * 4 + bit_at(bits, 51) * 8;
     let hour_tens = bit_at(bits, 56) + bit_at(bits, 57) * 2;
 
     if frame_units > 9 || frame_tens > 3 {
@@ -341,7 +345,13 @@ impl Default for RateDetector {
 mod tests {
     use super::*;
 
-    fn feed_rate(detector: &mut RateDetector, start: u64, spf: u64, count: usize, drop: bool) -> u64 {
+    fn feed_rate(
+        detector: &mut RateDetector,
+        start: u64,
+        spf: u64,
+        count: usize,
+        drop: bool,
+    ) -> u64 {
         let mut index = start;
         for _ in 0..count {
             detector.push(index, drop);
@@ -453,7 +463,7 @@ mod tests {
                         *h = 0;
                     }
                 }
-                if drop && *s == 0 && *m % 10 != 0 {
+                if drop && *s == 0 && !(*m).is_multiple_of(10) {
                     *f = 2;
                 }
             }
@@ -514,7 +524,7 @@ mod tests {
         let mut ti = 0usize;
         let mut level = true;
         let mut rng = Lcg(seed | 1);
-        for i in 0..total_samples {
+        for (i, sample) in samples.iter_mut().enumerate().take(total_samples) {
             let t = i as f64;
             while ti < transitions.len() && transitions[ti] <= t {
                 level = !level;
@@ -524,8 +534,12 @@ mod tests {
             if invert {
                 ac = -ac;
             }
-            let noise = if noise_amp > 0.0 { rng.next() * noise_amp } else { 0.0 };
-            samples[i] = ac + dc_offset + noise;
+            let noise = if noise_amp > 0.0 {
+                rng.next() * noise_amp
+            } else {
+                0.0
+            };
+            *sample = ac + dc_offset + noise;
         }
         samples
     }
@@ -576,7 +590,12 @@ mod tests {
         }
     }
 
-    fn expected_final(start: (u8, u8, u8, u8), num_frames: u32, fps_int: u32, drop: bool) -> (u8, u8, u8, u8) {
+    fn expected_final(
+        start: (u8, u8, u8, u8),
+        num_frames: u32,
+        fps_int: u32,
+        drop: bool,
+    ) -> (u8, u8, u8, u8) {
         let (mut h, mut m, mut s, mut f) = start;
         for i in 0..num_frames {
             if i > 0 {
@@ -590,7 +609,20 @@ mod tests {
     fn decodes_exact_values() {
         let start = (10, 20, 30, 5);
         let num_frames = 10;
-        let samples = generate_ltc(start, false, num_frames + 1, 25.0, 25, 48000, 1.0, 0.8, 0.0, false, 0.0, 2);
+        let samples = generate_ltc(
+            start,
+            false,
+            num_frames + 1,
+            25.0,
+            25,
+            48000,
+            1.0,
+            0.8,
+            0.0,
+            false,
+            0.0,
+            2,
+        );
         let mut dec = Decoder::new();
         let frames = dec.push(&samples, 48000);
         assert!(!frames.is_empty());
@@ -605,8 +637,34 @@ mod tests {
 
     #[test]
     fn inverted_polarity_matches_normal() {
-        let normal = generate_ltc((5, 5, 5, 5), false, 10, 25.0, 25, 48000, 1.0, 0.8, 0.0, false, 0.0, 3);
-        let inverted = generate_ltc((5, 5, 5, 5), false, 10, 25.0, 25, 48000, 1.0, 0.8, 0.0, true, 0.0, 3);
+        let normal = generate_ltc(
+            (5, 5, 5, 5),
+            false,
+            10,
+            25.0,
+            25,
+            48000,
+            1.0,
+            0.8,
+            0.0,
+            false,
+            0.0,
+            3,
+        );
+        let inverted = generate_ltc(
+            (5, 5, 5, 5),
+            false,
+            10,
+            25.0,
+            25,
+            48000,
+            1.0,
+            0.8,
+            0.0,
+            true,
+            0.0,
+            3,
+        );
         let mut d1 = Decoder::new();
         let mut d2 = Decoder::new();
         let f1 = d1.push(&normal, 48000);
@@ -624,7 +682,20 @@ mod tests {
     #[test]
     fn dc_offset_does_not_break_decode() {
         for &offset in &[0.3f32, -0.3, 0.15] {
-            let samples = generate_ltc((0, 0, 0, 0), false, 10, 25.0, 25, 48000, 1.0, 0.5, offset, false, 0.0, 4);
+            let samples = generate_ltc(
+                (0, 0, 0, 0),
+                false,
+                10,
+                25.0,
+                25,
+                48000,
+                1.0,
+                0.5,
+                offset,
+                false,
+                0.0,
+                4,
+            );
             let mut dec = Decoder::new();
             let frames = dec.push(&samples, 48000);
             assert!(!frames.is_empty(), "failed with dc offset {offset}");
@@ -635,34 +706,79 @@ mod tests {
     fn tolerates_additive_noise() {
         let mut worked_noise = 0.0f32;
         for &noise in &[0.02f32, 0.05, 0.1, 0.15] {
-            let samples = generate_ltc((0, 0, 0, 0), false, 12, 25.0, 25, 48000, 1.0, 0.8, 0.0, false, noise, 5);
+            let samples = generate_ltc(
+                (0, 0, 0, 0),
+                false,
+                12,
+                25.0,
+                25,
+                48000,
+                1.0,
+                0.8,
+                0.0,
+                false,
+                noise,
+                5,
+            );
             let mut dec = Decoder::new();
             let frames = dec.push(&samples, 48000);
             if !frames.is_empty() {
                 worked_noise = noise;
             }
         }
-        assert!(worked_noise > 0.0, "decoder never survived any noise level tested");
+        assert!(
+            worked_noise > 0.0,
+            "decoder never survived any noise level tested"
+        );
     }
 
     #[test]
     fn amplitude_range() {
         let mut min_working = f32::MAX;
         for &amp in &[0.95f32, 0.5, 0.1, 0.02, 0.01] {
-            let samples = generate_ltc((0, 0, 0, 0), false, 10, 25.0, 25, 48000, 1.0, amp, 0.0, false, 0.0, 6);
+            let samples = generate_ltc(
+                (0, 0, 0, 0),
+                false,
+                10,
+                25.0,
+                25,
+                48000,
+                1.0,
+                amp,
+                0.0,
+                false,
+                0.0,
+                6,
+            );
             let mut dec = Decoder::new();
             let frames = dec.push(&samples, 48000);
             if !frames.is_empty() && amp < min_working {
                 min_working = amp;
             }
         }
-        assert!(min_working < f32::MAX, "decoder never worked at any tested amplitude");
+        assert!(
+            min_working < f32::MAX,
+            "decoder never worked at any tested amplitude"
+        );
     }
 
     #[test]
     fn varispeed_tolerance() {
         for &vs in &[0.97f64, 0.98, 1.0, 1.02, 1.03] {
-            let samples = generate_ltc((0, 0, 0, 0), false, 10, 25.0, 25, 48000, vs, 0.8, 0.0, false, 0.0, 7);
+            let samples = generate_ltc(
+                (0, 0, 0, 0),
+                false,
+                10,
+                25.0,
+                25,
+                48000,
+                vs,
+                0.8,
+                0.0,
+                false,
+                0.0,
+                7,
+            );
             let mut dec = Decoder::new();
             let frames = dec.push(&samples, 48000);
             assert!(!frames.is_empty(), "failed at varispeed {vs}");
@@ -671,7 +787,20 @@ mod tests {
 
     #[test]
     fn split_buffers_match_unsplit_at_every_offset() {
-        let samples = generate_ltc((3, 4, 5, 0), false, 10, 25.0, 25, 48000, 1.0, 0.8, 0.0, false, 0.0, 8);
+        let samples = generate_ltc(
+            (3, 4, 5, 0),
+            false,
+            10,
+            25.0,
+            25,
+            48000,
+            1.0,
+            0.8,
+            0.0,
+            false,
+            0.0,
+            8,
+        );
         let mut whole = Decoder::new();
         let reference = whole.push(&samples, 48000);
         assert!(!reference.is_empty());
@@ -687,7 +816,20 @@ mod tests {
 
     #[test]
     fn split_at_many_offsets_across_frame() {
-        let samples = generate_ltc((0, 1, 0, 0), false, 14, 25.0, 25, 48000, 1.0, 0.8, 0.0, false, 0.0, 9);
+        let samples = generate_ltc(
+            (0, 1, 0, 0),
+            false,
+            14,
+            25.0,
+            25,
+            48000,
+            1.0,
+            0.8,
+            0.0,
+            false,
+            0.0,
+            9,
+        );
         let mut whole = Decoder::new();
         let reference = whole.push(&samples, 48000);
         assert!(!reference.is_empty());
@@ -706,10 +848,23 @@ mod tests {
 
     #[test]
     fn corrupted_sync_word_yields_no_frame() {
-        let mut samples = generate_ltc((0, 0, 0, 0), false, 3, 25.0, 25, 48000, 1.0, 0.8, 0.0, false, 0.0, 10);
+        let mut samples = generate_ltc(
+            (0, 0, 0, 0),
+            false,
+            3,
+            25.0,
+            25,
+            48000,
+            1.0,
+            0.8,
+            0.0,
+            false,
+            0.0,
+            10,
+        );
         let n = samples.len();
-        for i in (n / 3)..(n / 3 + n / 6) {
-            samples[i] = 0.0;
+        for sample in samples.iter_mut().skip(n / 3).take(n / 6) {
+            *sample = 0.0;
         }
         let mut dec = Decoder::new();
         let frames = dec.push(&samples, 48000);
@@ -718,7 +873,20 @@ mod tests {
 
     #[test]
     fn truncated_frame_yields_no_frame() {
-        let samples = generate_ltc((0, 0, 0, 0), false, 2, 25.0, 25, 48000, 1.0, 0.8, 0.0, false, 0.0, 11);
+        let samples = generate_ltc(
+            (0, 0, 0, 0),
+            false,
+            2,
+            25.0,
+            25,
+            48000,
+            1.0,
+            0.8,
+            0.0,
+            false,
+            0.0,
+            11,
+        );
         let cut = samples.len() * 3 / 4;
         let truncated = &samples[..cut];
         let mut dec = Decoder::new();
@@ -746,7 +914,20 @@ mod tests {
 
     #[test]
     fn reverse_play_does_not_emit_garbage() {
-        let samples = generate_ltc((1, 1, 1, 0), false, 5, 25.0, 25, 48000, 1.0, 0.8, 0.0, false, 0.0, 12);
+        let samples = generate_ltc(
+            (1, 1, 1, 0),
+            false,
+            5,
+            25.0,
+            25,
+            48000,
+            1.0,
+            0.8,
+            0.0,
+            false,
+            0.0,
+            12,
+        );
         let mut reversed = samples.clone();
         reversed.reverse();
         let mut dec = Decoder::new();
@@ -765,7 +946,20 @@ mod tests {
             (23, 59, 59, 0),
         ];
         for &(h, m, s, f) in &cases {
-            let samples = generate_ltc((h, m, s, f), false, 10, 25.0, 25, 48000, 1.0, 0.8, 0.0, false, 0.0, 13);
+            let samples = generate_ltc(
+                (h, m, s, f),
+                false,
+                10,
+                25.0,
+                25,
+                48000,
+                1.0,
+                0.8,
+                0.0,
+                false,
+                0.0,
+                13,
+            );
             let mut dec = Decoder::new();
             let frames = dec.push(&samples, 48000);
             assert!(!frames.is_empty(), "no frames for start {h}:{m}:{s}:{f}");

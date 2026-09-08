@@ -11,6 +11,7 @@ const MENU_DISARM_UNTIL_NEXT_NIGHT: &str = "disarm-until-next-night";
 const MENU_CLEAR_OVERRIDE: &str = "clear-override";
 const MENU_QUIT: &str = "quit";
 
+#[derive(Clone)]
 pub(crate) struct TrayHandles {
     pub armed_item: MenuItem<Wry>,
     pub supervisor_item: MenuItem<Wry>,
@@ -45,14 +46,14 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
     let arm_item = MenuItem::with_id(
         app,
         MENU_ARM_UNTIL_NIGHT_ENDS,
-        "Arm for this night",
+        "Arm until cleared",
         true,
         None::<&str>,
     )?;
     let disarm_item = MenuItem::with_id(
         app,
         MENU_DISARM_UNTIL_NEXT_NIGHT,
-        "Disarm until next night",
+        "Disarm until cleared",
         true,
         None::<&str>,
     )?;
@@ -93,8 +94,11 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
         .cloned()
         .ok_or_else(|| tauri::Error::AssetNotFound("default window icon is missing".into()))?;
 
-    TrayIconBuilder::new()
-        .icon(icon)
+    let builder = TrayIconBuilder::new().icon(icon);
+    #[cfg(target_os = "macos")]
+    let builder = builder.icon_as_template(true);
+
+    builder
         .menu(&menu)
         .show_menu_on_left_click(true)
         .tooltip("ShowMesh Companion")
@@ -121,7 +125,9 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
 
 fn apply_override(app: &AppHandle, value: ArmingOverride) {
     let state = app.state::<AppState>();
-    let _ = state.apply_override(value);
+    if let Err(error) = state.apply_override(value) {
+        state.report_tray_error(&error);
+    }
 }
 
 pub(crate) fn open_settings(app: &AppHandle) {

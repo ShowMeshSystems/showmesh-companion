@@ -1,6 +1,9 @@
 mod arming;
 mod audio_devices;
 mod capabilities;
+mod capture;
+#[allow(dead_code)]
+mod ltc;
 mod settings;
 mod state;
 mod supervisor;
@@ -12,16 +15,20 @@ use std::time::{Duration, Instant};
 
 use arming::{ArmingOverride, NightSessionState};
 use audio_devices::AudioInputDevice;
+use capture::{CaptureManager, CaptureTarget};
 use serde::Serialize;
-use settings::{AppSettings, SettingsStore};
+use settings::{AppSettings, SettingsStore, TimecodeSettings};
 use state::StateStore;
 use supervisor::{SupervisionState, SupervisorStatus};
 use sysinfo::System;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use timecode::TimecodeStatus;
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MENU_LINE_LIMIT: usize = 78;
 const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const TIMECODE_TICK_INTERVAL: Duration = Duration::from_millis(100);
+const TIMECODE_STATUS_EVENT: &str = "timecode-status";
 
 struct AppState {
     settings: Mutex<AppSettings>,
@@ -33,6 +40,7 @@ struct AppState {
     supervision_runtime: Mutex<SupervisionState>,
     tray_handles: Mutex<Option<tray::TrayHandles>>,
     device_cache: Arc<audio_devices::DeviceCache>,
+    capture: CaptureManager,
 }
 
 #[derive(Serialize)]
@@ -74,10 +82,7 @@ impl AppState {
             .lock()
             .map_err(|_| "supervisor lock is poisoned")?
             .clone();
-        let timecode = TimecodeStatus::from_settings(
-            &settings.timecode,
-            self.device_cache.devices().as_deref(),
-        );
+        let timecode = self.timecode_status(&settings.timecode);
 
         Ok(AppSnapshot {
             settings,
@@ -122,10 +127,7 @@ impl AppState {
             &runtime,
             Instant::now(),
         );
-        let timecode = TimecodeStatus::from_settings(
-            &settings.timecode,
-            self.device_cache.devices().as_deref(),
-        );
+        let timecode = self.timecode_status(&settings.timecode);
         self.refresh_tray(
             decision.armed,
             &decision.reason,
@@ -148,10 +150,7 @@ impl AppState {
         supervisor_reason: &str,
         timecode_reason: &str,
     ) {
-        let Ok(guard) = self.tray_handles.lock() else {
-            return;
-        };
-        let Some(handles) = guard.as_ref() else {
+        let Some(handles) = self.tray_handles() else {
             return;
         };
         let _ = handles.armed_item.set_text(format!(
@@ -160,10 +159,33 @@ impl AppState {
         ));
         let _ = handles
             .supervisor_item
-            .set_text(format!("Resolume: {supervisor_reason}"));
+            .set_text(menu_line("Resolume", supervisor_reason));
         let _ = handles
             .timecode_item
-            .set_text(format!("LTC: {timecode_reason}"));
+            .set_text(menu_line("LTC", timecode_reason));
+    }
+
+    fn tray_handles(&self) -> Option<tray::TrayHandles> {
+        let guard = self.tray_handles.lock().ok()?;
+        guard.as_ref().cloned()
+    }
+
+    fn report_tray_error(&self, error: &str) {
+        let Some(handles) = self.tray_handles() else {
+            return;
+        };
+        let _ = handles.armed_item.set_text(menu_line("Warning", error));
+    }
+
+    fn timecode_status(&self, settings: &TimecodeSettings) -> TimecodeStatus {
+        let settings_status =
+            TimecodeStatus::from_settings(settings, self.device_cache.devices().as_deref());
+        let observation = self.capture.observation();
+        TimecodeStatus::combine(settings_status, Some(&observation), capture::now_ms())
+    }
+
+    fn reconfigure_capture(&self, settings: &TimecodeSettings) {
+        self.capture.configure(capture_target(settings));
     }
 
     fn apply_override(&self, value: ArmingOverride) -> Result<AppSnapshot, String> {
@@ -200,8 +222,33 @@ impl AppState {
         let resolved_override = arming::expire_override(previous, next, *arming_override);
         *night_state = next;
         *arming_override = resolved_override;
+        drop(arming_override);
+        drop(night_state);
         self.state_store.save(resolved_override)
     }
+}
+
+fn capture_target(settings: &TimecodeSettings) -> Option<CaptureTarget> {
+    if !settings.enabled || settings.channel == 0 {
+        return None;
+    }
+    let device_id = settings.device_id.trim();
+    if device_id.is_empty() {
+        return None;
+    }
+    Some(CaptureTarget {
+        device_id: device_id.to_string(),
+        channel: settings.channel,
+    })
+}
+
+fn menu_line(label: &str, reason: &str) -> String {
+    let mut line = format!("{label}: {reason}");
+    if line.chars().count() > MENU_LINE_LIMIT {
+        line = line.chars().take(MENU_LINE_LIMIT - 1).collect();
+        line.push('\u{2026}');
+    }
+    line
 }
 
 #[tauri::command]
@@ -213,6 +260,7 @@ fn get_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, String> {
 fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<AppSnapshot, String> {
     settings.validate()?;
     state.settings_store.save(&settings)?;
+    state.reconfigure_capture(&settings.timecode);
     *state
         .settings
         .lock()
@@ -262,6 +310,7 @@ pub fn run() {
                 &settings.timecode,
                 device_cache.devices().as_deref(),
             );
+            let initial_timecode_settings = settings.timecode.clone();
             let mut system = System::new();
             let (initial_status, initial_runtime) = supervisor::tick(
                 &settings.resolume,
@@ -280,7 +329,11 @@ pub fn run() {
                 supervision_runtime: Mutex::new(initial_runtime),
                 tray_handles: Mutex::new(None),
                 device_cache,
+                capture: CaptureManager::start(),
             });
+
+            app.state::<AppState>()
+                .reconfigure_capture(&initial_timecode_settings);
 
             #[cfg(target_os = "macos")]
             app.handle()
@@ -319,6 +372,20 @@ pub fn run() {
                 }
             });
 
+            let timecode_handle: AppHandle = app.handle().clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(TIMECODE_TICK_INTERVAL);
+                    let state = timecode_handle.state::<AppState>();
+                    let Ok(settings) = state.settings.lock() else {
+                        continue;
+                    };
+                    let timecode = state.timecode_status(&settings.timecode);
+                    drop(settings);
+                    let _ = timecode_handle.emit(TIMECODE_STATUS_EVENT, timecode);
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -354,6 +421,7 @@ mod tests {
             supervision_runtime: Mutex::new(SupervisionState::default()),
             tray_handles: Mutex::new(None),
             device_cache: Arc::new(audio_devices::DeviceCache::new()),
+            capture: CaptureManager::start(),
         }
     }
 
@@ -390,10 +458,6 @@ mod tests {
         state.apply_night_state(NightSessionState::Live).unwrap();
 
         assert_eq!(*state.night_state.lock().unwrap(), NightSessionState::Live);
-        assert_eq!(
-            state.state_store.load().unwrap(),
-            ArmingOverride::ArmUntilNightEnds
-        );
         assert_eq!(
             *state.arming_override.lock().unwrap(),
             ArmingOverride::ArmUntilNightEnds

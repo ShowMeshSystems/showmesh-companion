@@ -93,6 +93,19 @@ input::placeholder { color: var(--text-muted); opacity: .75; }
 .switch input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 2px; }
 .module-notice { margin: 12px 0 0; padding: 12px; border-radius: var(--radius); color: var(--warning-text); background: var(--warning-bg); font-size: 12px; }
 .device-actions { margin-top: 12px; }
+
+.timecode-live { margin-top: 16px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--status-surface); }
+.timecode-value { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-variant-numeric: tabular-nums; font-size: 32px; font-weight: 650; letter-spacing: .02em; color: var(--status-text); }
+.timecode-live[data-state="locked"] .timecode-value { color: var(--success); }
+.timecode-live[data-state="no-lock"] .timecode-value,
+.timecode-live[data-state="no-audio"] .timecode-value { color: var(--status-muted); }
+.timecode-live[data-state="decode-failed"] .timecode-value { color: var(--danger); }
+.timecode-meta { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px 16px; margin: 14px 0 0; padding: 14px 0 0; border-top: 1px solid var(--status-border); }
+.timecode-meta div { display: grid; gap: 2px; }
+.timecode-meta dt { margin: 0; color: var(--status-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.timecode-meta dd { margin: 0; font-size: 12px; color: var(--status-text); font-variant-numeric: tabular-nums; text-transform: capitalize; }
+.timecode-live .module-notice { color: var(--status-text); background: color-mix(in srgb, var(--status-border) 55%, transparent); }
+.timecode-caveat { margin: 12px 0 0; color: var(--status-muted); font-size: 11px; }
 .detail-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px 16px; margin: 12px 0 0; padding: 0; }
 .detail-grid div { display: grid; gap: 2px; }
 .detail-grid dt { margin: 0; color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }

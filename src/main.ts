@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 type ArmingPolicy = "follow-show-night" | "always-armed" | "always-disarmed";
 type ArmingOverride = "none" | "arm-until-night-ends" | "disarm-until-next-night";
@@ -20,6 +21,36 @@ interface AudioInputDevice {
   configKnown: boolean;
 }
 
+type TimecodeState =
+  | "disabled"
+  | "not-configured"
+  | "not-started"
+  | "device-unavailable"
+  | "channel-unavailable"
+  | "no-audio"
+  | "no-lock"
+  | "locked"
+  | "decode-failed";
+
+interface ObservedFrame {
+  hours: number;
+  minutes: number;
+  seconds: number;
+  frames: number;
+  dropFrame: boolean;
+}
+
+interface TimecodeStatus {
+  state: TimecodeState;
+  reason: string;
+  operational: boolean;
+  level: number | null;
+  frame: ObservedFrame | null;
+  frameAgeMs: number | null;
+  detectedFrameRate: string | null;
+  frameRateComparison: "match" | "mismatch" | "unknown-expected-unobserved";
+}
+
 interface Snapshot {
   settings: Settings;
   capabilities: Array<{ id: string; version: number }>;
@@ -35,7 +66,7 @@ interface Snapshot {
     lastError: string | null;
     matchedBy: string;
   };
-  timecode: { state: string; reason: string; operational: boolean };
+  timecode: TimecodeStatus;
 }
 
 function requireAppRoot(): HTMLElement {
@@ -87,7 +118,7 @@ function render(): void {
     <section class="status-band" aria-label="Current state">
       <div><span>Show Night</span><strong>${escapeHtml(snapshot.nightState)}</strong></div>
       <div><span>Process monitor</span><strong>${escapeHtml(snapshot.supervisor.state)}</strong></div>
-      <div><span>LTC</span><strong>${escapeHtml(snapshot.timecode.state)}</strong></div>
+      <div><span>LTC</span><strong id="status-timecode-state">${escapeHtml(snapshot.timecode.state)}</strong></div>
       <div><span>Controller</span><strong>${settings.coordinatorUrl ? "Configured" : "Not configured"}</strong></div>
       <p>${escapeHtml(snapshot.armingReason)}</p>
     </section>
@@ -141,7 +172,7 @@ function render(): void {
             <button type="button" class="button secondary" id="refresh-devices" ${audioDevicesLoading ? "disabled" : ""}>${audioDevicesLoading ? "Refreshing…" : "Refresh device list"}</button>
           </div>
           ${audioDevicesError ? `<p class="form-error" role="alert">${escapeHtml(audioDevicesError)}</p>` : ""}
-          <p class="module-notice">${escapeHtml(snapshot.timecode.reason)}</p>
+          ${timecodeLive(snapshot.timecode)}
         </article>
       </section>
 
@@ -213,6 +244,72 @@ function policyOption(value: ArmingPolicy, label: string, selected: ArmingPolicy
   return `<label><input type="radio" name="armingPolicy" value="${value}" ${value === selected ? "checked" : ""}/><span>${label}</span></label>`;
 }
 
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function formatTimecodeValue(frame: ObservedFrame | null): string {
+  if (!frame) return "--:--:--:--";
+  return `${pad2(frame.hours)}:${pad2(frame.minutes)}:${pad2(frame.seconds)}:${pad2(frame.frames)}`;
+}
+
+function formatFrameRate(rate: string | null): string {
+  return rate ? `${rate} fps` : "Not detected";
+}
+
+function formatDropFrame(frame: ObservedFrame | null): string {
+  if (!frame) return "Unknown";
+  return frame.dropFrame ? "Drop frame" : "Non-drop frame";
+}
+
+function formatAge(ms: number | null): string {
+  if (ms === null) return "No frame decoded yet";
+  if (ms < 1000) return `${ms} ms ago`;
+  return `${(ms / 1000).toFixed(1)} s ago`;
+}
+
+function formatLevel(level: number | null): string {
+  if (level === null) return "Unknown";
+  return level.toFixed(3);
+}
+
+function timecodeLive(status: Snapshot["timecode"]): string {
+  return `
+    <div class="timecode-live" id="timecode-live" data-state="${status.state}">
+      <div class="timecode-value" id="tc-value">${formatTimecodeValue(status.frame)}</div>
+      <dl class="timecode-meta">
+        <div><dt>Lock state</dt><dd id="tc-state">${escapeHtml(status.state)}</dd></div>
+        <div><dt>Frame rate</dt><dd id="tc-rate">${formatFrameRate(status.detectedFrameRate)}</dd></div>
+        <div><dt>Drop frame</dt><dd id="tc-drop">${formatDropFrame(status.frame)}</dd></div>
+        <div><dt>Last frame</dt><dd id="tc-age">${formatAge(status.frameAgeMs)}</dd></div>
+        <div><dt>Input level</dt><dd id="tc-level">${formatLevel(status.level)}</dd></div>
+      </dl>
+      <p class="module-notice" id="tc-reason">${escapeHtml(status.reason)}</p>
+      <p class="timecode-caveat">This is timecode received by this computer. It is not evidence that Resolume, or any other consumer, received or followed it.</p>
+    </div>`;
+}
+
+function setText(selector: string, value: string): void {
+  const element = document.querySelector<HTMLElement>(selector);
+  if (element) element.textContent = value;
+}
+
+// Called from the 10 Hz "timecode-status" event. Must never call render(): a full
+// re-render on every tick would destroy focus and in-progress edits in the settings form.
+function updateTimecodeLive(status: TimecodeStatus): void {
+  if (snapshot) snapshot.timecode = status;
+  const container = document.querySelector<HTMLElement>("#timecode-live");
+  if (container) container.dataset.state = status.state;
+  setText("#tc-value", formatTimecodeValue(status.frame));
+  setText("#tc-state", status.state);
+  setText("#tc-rate", formatFrameRate(status.detectedFrameRate));
+  setText("#tc-drop", formatDropFrame(status.frame));
+  setText("#tc-age", formatAge(status.frameAgeMs));
+  setText("#tc-level", formatLevel(status.level));
+  setText("#tc-reason", status.reason);
+  setText("#status-timecode-state", status.state);
+}
+
 async function load(): Promise<void> {
   error = null;
   render();
@@ -275,3 +372,4 @@ async function setOverride(value: ArmingOverride): Promise<void> {
 
 void load();
 void loadAudioDevices();
+void listen<TimecodeStatus>("timecode-status", (event) => updateTimecodeLive(event.payload));

@@ -203,6 +203,20 @@ fn status_launch_failed(state: &SupervisionState) -> SupervisorStatus {
     }
 }
 
+fn status_vanished_early(state: &SupervisionState) -> SupervisorStatus {
+    SupervisorStatus {
+        state: SupervisorState::LaunchFailed,
+        reason: format!(
+            "A launched process stopped before it had run long enough to be considered stable. That has happened {} time(s) in a row.",
+            state.consecutive_failures
+        ),
+        operational: false,
+        consecutive_failures: state.consecutive_failures,
+        last_error: state.last_error.clone(),
+        matched_by: ProcessMatch::NotMatched,
+    }
+}
+
 fn status_backoff(state: &SupervisionState) -> SupervisorStatus {
     SupervisorStatus {
         state: SupervisorState::Backoff,
@@ -303,6 +317,12 @@ pub fn decide(
         return (SupervisionAction::DoNothing, next_state, status);
     }
 
+    if !input.armed {
+        let next_state = state.clone();
+        let status = status_absent_disarmed(&next_state);
+        return (SupervisionAction::DoNothing, next_state, status);
+    }
+
     match state.phase {
         Phase::Launching { since } => {
             let elapsed = now.saturating_duration_since(since);
@@ -317,9 +337,11 @@ pub fn decide(
             }
         }
         Phase::Running { since } => {
-            if now.saturating_duration_since(since) < STABILITY_WINDOW {
+            if state.last_spawn_at.is_some()
+                && now.saturating_duration_since(since) < STABILITY_WINDOW
+            {
                 let next_state = failed_attempt(state, now, None);
-                let status = status_launch_failed(&next_state);
+                let status = status_vanished_early(&next_state);
                 (SupervisionAction::AwaitBackoff, next_state, status)
             } else {
                 let recovered = SupervisionState {
@@ -347,6 +369,15 @@ pub fn decide(
             }
         }
         Phase::Idle => decide_from_idle(input, state, now),
+    }
+}
+
+fn idle_keeping_history(state: &SupervisionState) -> SupervisionState {
+    SupervisionState {
+        consecutive_failures: 0,
+        last_error: None,
+        last_spawn_at: state.last_spawn_at,
+        phase: Phase::Idle,
     }
 }
 
@@ -541,13 +572,13 @@ pub fn tick(
     now: Instant,
 ) -> (SupervisorStatus, SupervisionState) {
     if !settings.enabled {
-        return (SupervisorStatus::disabled(), SupervisionState::default());
+        return (SupervisorStatus::disabled(), idle_keeping_history(state));
     }
     let configured = settings.application_path.trim();
     if configured.is_empty() {
         return (
             SupervisorStatus::not_configured(),
-            SupervisionState::default(),
+            idle_keeping_history(state),
         );
     }
     let configured_path = Path::new(configured);
@@ -562,10 +593,7 @@ pub fn tick(
                 last_error: None,
                 matched_by: ProcessMatch::NotMatched,
             },
-            SupervisionState {
-                phase: Phase::Idle,
-                ..state.clone()
-            },
+            state.clone(),
         );
     }
 
@@ -916,8 +944,98 @@ mod tests {
         );
         assert_eq!(action, SupervisionAction::DoNothing);
         assert_eq!(status.state, SupervisorState::AbsentDisarmed);
-        assert_eq!(next_state.phase, Phase::Idle);
+        assert_eq!(next_state.phase, backing_off.phase);
         assert_eq!(next_state.consecutive_failures, 3);
+    }
+
+    #[test]
+    fn disarming_is_reported_immediately_from_every_phase() {
+        let t0 = Instant::now();
+        let phases = [
+            Phase::Idle,
+            Phase::Launching { since: t0 },
+            Phase::Running { since: t0 },
+            Phase::Backoff {
+                until: t0 + Duration::from_secs(30),
+            },
+        ];
+        for phase in phases {
+            let state = SupervisionState {
+                consecutive_failures: 5,
+                last_error: None,
+                last_spawn_at: Some(t0),
+                phase: phase.clone(),
+            };
+            let (action, next_state, status) = decide(
+                &input(ProcessMatch::NotMatched, false),
+                &state,
+                t0 + Duration::from_secs(1),
+            );
+            assert_eq!(action, SupervisionAction::DoNothing);
+            assert_eq!(status.state, SupervisorState::AbsentDisarmed, "{phase:?}");
+            assert_eq!(next_state.phase, phase);
+        }
+    }
+
+    #[test]
+    fn a_process_this_app_never_launched_vanishing_is_not_a_failed_launch() {
+        let t0 = Instant::now();
+        let adopted = SupervisionState {
+            consecutive_failures: 0,
+            last_error: None,
+            last_spawn_at: None,
+            phase: Phase::Running { since: t0 },
+        };
+        let (action, next_state, _) = decide(
+            &input(ProcessMatch::NotMatched, true),
+            &adopted,
+            t0 + Duration::from_secs(5),
+        );
+        assert_eq!(action, SupervisionAction::Spawn);
+        assert_eq!(next_state.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn a_transient_path_miss_preserves_the_grace_window() {
+        let t0 = Instant::now();
+        let mut system = System::new();
+        let launching = SupervisionState {
+            consecutive_failures: 0,
+            last_error: None,
+            last_spawn_at: Some(t0),
+            phase: Phase::Launching { since: t0 },
+        };
+        let settings = ResolumeSettings {
+            enabled: true,
+            application_path: "/nonexistent/Arena.app".into(),
+        };
+        let (_, next_state) = tick(&settings, true, &mut system, &launching, t0);
+        assert_eq!(next_state.phase, Phase::Launching { since: t0 });
+    }
+
+    #[test]
+    fn toggling_the_module_off_and_on_does_not_grant_an_immediate_launch() {
+        let t0 = Instant::now();
+        let mut system = System::new();
+        let just_spawned = SupervisionState {
+            consecutive_failures: 0,
+            last_error: None,
+            last_spawn_at: Some(t0),
+            phase: Phase::Launching { since: t0 },
+        };
+        let disabled = ResolumeSettings {
+            enabled: false,
+            application_path: "/nonexistent/Arena.app".into(),
+        };
+        let (_, after_off) = tick(&disabled, true, &mut system, &just_spawned, t0);
+        assert_eq!(after_off.last_spawn_at, Some(t0));
+
+        let (action, _, _) = decide(
+            &input(ProcessMatch::NotMatched, true),
+            &after_off,
+            t0 + Duration::from_secs(2),
+        );
+        assert_eq!(action, SupervisionAction::AwaitSpawnInterval);
     }
 
     #[test]

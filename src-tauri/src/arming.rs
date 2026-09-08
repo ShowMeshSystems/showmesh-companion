@@ -48,13 +48,10 @@ pub fn resolve(
 ) -> ArmingDecision {
     match override_value {
         ArmingOverride::ArmUntilNightEnds => {
-            return decision(true, "Manual override: armed until this Show Night ends.");
+            return decision(true, "Manual override: armed.");
         }
         ArmingOverride::DisarmUntilNextNight => {
-            return decision(
-                false,
-                "Manual override: disarmed until the next Show Night.",
-            );
+            return decision(false, "Manual override: disarmed.");
         }
         ArmingOverride::None => {}
     }
