@@ -67,6 +67,7 @@ interface Snapshot {
     matchedBy: string;
   };
   timecode: TimecodeStatus;
+  settingsNotice: string | null;
 }
 
 function requireAppRoot(): HTMLElement {
@@ -89,6 +90,27 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (character) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
   })[character] ?? character);
+}
+
+function readForm(): Settings | null {
+  const form = document.querySelector<HTMLFormElement>("#settings-form");
+  if (!form) return null;
+  const data = new FormData(form);
+  return {
+    companionName: String(data.get("companionName") ?? ""),
+    coordinatorUrl: String(data.get("coordinatorUrl") ?? ""),
+    armingPolicy: String(data.get("armingPolicy")) as ArmingPolicy,
+    launchAtLogin: data.has("launchAtLogin"),
+    resolume: { enabled: data.has("resolumeEnabled"), applicationPath: String(data.get("applicationPath") ?? "") },
+    timecode: { enabled: data.has("timecodeEnabled"), deviceId: String(data.get("deviceId") ?? ""), channel: Number(data.get("channel") ?? 1) },
+  };
+}
+
+// Any control inside the form re-renders the page, which would discard edits the
+// operator has typed but not saved. Capture them first so the re-render restores them.
+function captureDraft(): void {
+  const current = readForm();
+  if (current) draft = current;
 }
 
 function render(): void {
@@ -115,6 +137,8 @@ function render(): void {
       </div>
     </header>
 
+    ${snapshot.settingsNotice ? `<p class="form-error" role="alert">${escapeHtml(snapshot.settingsNotice)}</p>` : ""}
+
     <section class="status-band" aria-label="Current state">
       <div><span>Show Night</span><strong>${escapeHtml(snapshot.nightState)}</strong></div>
       <div><span>Process monitor</span><strong>${escapeHtml(snapshot.supervisor.state)}</strong></div>
@@ -130,7 +154,7 @@ function render(): void {
           <label><span>Companion name</span><input name="companionName" required value="${escapeHtml(settings.companionName)}" /></label>
           <label><span>Coordinator address</span><input name="coordinatorUrl" type="url" placeholder="http://showmesh.local:8080" value="${escapeHtml(settings.coordinatorUrl)}" /></label>
         </div>
-        <label class="check"><input name="launchAtLogin" type="checkbox" ${settings.launchAtLogin ? "checked" : ""}/><span><strong>Open at login</strong><small>This preference is saved, but OS login registration is not operational in the foundation build.</small></span></label>
+        <label class="check"><input name="launchAtLogin" type="checkbox" ${settings.launchAtLogin ? "checked" : ""}/><span><strong>Open at login</strong><small>This preference is saved, but the application does not register itself with the operating system yet.</small></span></label>
       </section>
 
       <section class="section">
@@ -146,7 +170,7 @@ function render(): void {
           <button type="button" class="button secondary" data-override="disarm-until-next-night">Disarm until next night</button>
           <button type="button" class="button ghost" data-override="none">Clear</button>
         </div>
-        <p class="module-notice">A temporary override is saved on this computer and stays in force after a restart. Expiry depends on Show Night state, which has not been observed yet, so an override only ends when it is cleared here.</p>
+        <p class="module-notice">A temporary override is saved on this computer and stays in force after a restart. Expiry depends on Show Night state, which has not been observed yet, so an override stays in force until it is cleared, either here or from the tray menu.</p>
       </section>
 
       <section class="section modules">
@@ -187,14 +211,20 @@ function render(): void {
 
   document.querySelector<HTMLFormElement>("#settings-form")?.addEventListener("submit", save);
   document.querySelectorAll<HTMLButtonElement>("[data-override]").forEach((button) => {
-    button.addEventListener("click", () => setOverride(button.dataset.override as ArmingOverride));
+    button.addEventListener("click", () => {
+      captureDraft();
+      void setOverride(button.dataset.override as ArmingOverride);
+    });
   });
   document
     .querySelector<HTMLSelectElement>('select[name="deviceId"]')
     ?.addEventListener("change", handleDeviceChange);
   document
     .querySelector<HTMLButtonElement>("#refresh-devices")
-    ?.addEventListener("click", () => void loadAudioDevices());
+    ?.addEventListener("click", () => {
+      captureDraft();
+      void loadAudioDevices();
+    });
 }
 
 function handleDeviceChange(event: Event): void {
@@ -221,9 +251,9 @@ function deviceOptions(devices: AudioInputDevice[], selectedId: string): string 
   }
   for (const device of devices) {
     const detail = !device.configKnown
-      ? " — configuration unavailable"
+      ? " (configuration unavailable)"
       : device.channels !== null
-        ? ` — ${device.channels} channel${device.channels === 1 ? "" : "s"}`
+        ? ` (${device.channels} channel${device.channels === 1 ? "" : "s"})`
         : "";
     options.push(
       `<option value="${escapeHtml(device.id)}" ${device.id === selectedId ? "selected" : ""}>${escapeHtml(device.name)}${detail}</option>`,
@@ -337,15 +367,8 @@ async function loadAudioDevices(): Promise<void> {
 async function save(event: SubmitEvent): Promise<void> {
   event.preventDefault();
   if (!snapshot) return;
-  const data = new FormData(event.currentTarget as HTMLFormElement);
-  const settings: Settings = {
-    companionName: String(data.get("companionName") ?? ""),
-    coordinatorUrl: String(data.get("coordinatorUrl") ?? ""),
-    armingPolicy: String(data.get("armingPolicy")) as ArmingPolicy,
-    launchAtLogin: data.has("launchAtLogin"),
-    resolume: { enabled: data.has("resolumeEnabled"), applicationPath: String(data.get("applicationPath") ?? "") },
-    timecode: { enabled: data.has("timecodeEnabled"), deviceId: String(data.get("deviceId") ?? ""), channel: Number(data.get("channel") ?? 1) },
-  };
+  const settings = readForm();
+  if (!settings) return;
   saving = true;
   draft = settings;
   error = null;
@@ -370,6 +393,31 @@ async function setOverride(value: ArmingOverride): Promise<void> {
   render();
 }
 
+// The tray can change arming state while this window is hidden, so the window
+// must never render a snapshot it took when it was last visible.
+function adoptSnapshot(next: Snapshot): void {
+  captureDraft();
+  snapshot = next;
+  render();
+}
+
+async function refresh(): Promise<void> {
+  try {
+    const next = await invoke<Snapshot>("get_snapshot");
+    error = null;
+    adoptSnapshot(next);
+  } catch (cause) {
+    error = String(cause);
+    render();
+  }
+}
+
+window.addEventListener("focus", () => void refresh());
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) void refresh();
+});
+
 void load();
 void loadAudioDevices();
 void listen<TimecodeStatus>("timecode-status", (event) => updateTimecodeLive(event.payload));
+void listen<Snapshot>("app-snapshot", (event) => adoptSnapshot(event.payload));

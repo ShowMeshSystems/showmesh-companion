@@ -1,6 +1,6 @@
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Emitter, Manager, Wry};
 
 use crate::AppState;
 use crate::arming::ArmingOverride;
@@ -125,8 +125,11 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
 
 fn apply_override(app: &AppHandle, value: ArmingOverride) {
     let state = app.state::<AppState>();
-    if let Err(error) = state.apply_override(value) {
-        state.report_tray_error(&error);
+    match state.apply_override(value) {
+        Ok(snapshot) => {
+            let _ = app.emit(crate::SNAPSHOT_EVENT, &snapshot);
+        }
+        Err(error) => state.report_tray_error(&error),
     }
 }
 
@@ -139,4 +142,7 @@ pub(crate) fn open_settings(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     let _ = app.show();
     let _ = window.set_focus();
+    if let Ok(snapshot) = app.state::<AppState>().snapshot() {
+        let _ = app.emit(crate::SNAPSHOT_EVENT, &snapshot);
+    }
 }

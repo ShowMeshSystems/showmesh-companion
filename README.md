@@ -1,15 +1,41 @@
 # ShowMesh Companion
 
-ShowMesh Companion is a small, cross-platform desktop host for capabilities that must run on an endpoint beside show software or an LTC consumer. It keeps configuration in its own settings UI and will advertise only modules that are enabled, configured, and proven operational.
+ShowMesh Companion is a small, cross-platform desktop application that runs on an endpoint machine beside show software. It watches for Resolume Arena and relaunches it when Resolume is absent and the application is armed, and it reports LTC timecode observed on that machine. ShowMesh remains authoritative for show state; the companion applies bounded local policy and reports what it observed locally.
 
-The current repository is a **foundation build**. It provides the desktop shell, persistent settings, capability derivation, Show Night arming policy, temporary overrides, and an honest status surface. Process observation/relaunch, audio capture/LTC decoding, coordinator transport, login registration, signing, and installers are not operational yet.
+## What is implemented, and what is verified
 
-## Initial modules
+Every module described below is implemented and covered by unit tests. None of it has been exercised on real hardware. The build was written and tested with no Resolume install, no audio interface, no LTC source, and no GUI session, so no runtime behavior has been observed: not the tray, not the settings window, not a launch of Resolume, not a decoded frame from a real interface. Treat the whole application as unproven until it has been worked through on a bench.
 
-- **Resolume supervision** will observe Resolume Arena locally and launch it when absent and armed. It will not expose kill, stop, or forced-restart controls.
-- **LTC observation** will report timecode received by this computer. That evidence must remain distinct from any claim that Resolume consumed or followed the timecode.
+`docs/BENCH-VERIFICATION.md` is the checklist that closes that gap. It is a release gate, not a suggestion.
 
-Each configured module contributes a capability (`process.supervise` or `timecode.ltc.observe`). Future modules can use the same lifecycle without turning the application into a Resolume-specific daemon.
+## What the application does
+
+- **Resolume supervision.** A poll thread looks for a process matching the configured Resolume Arena path every 2 seconds. If the process is absent and the application is armed, it launches Resolume, waits for it to appear, and backs off after a failed attempt. It never kills, stops, or forcibly restarts anything, and it never will: that boundary is a project constraint, not a missing feature.
+- **LTC observation.** A capture thread opens the configured audio input, decodes LTC from the configured channel, and reports the observed frame, the detected frame rate, the input level, and how long ago the last frame decoded. This is evidence that this computer received timecode. It is never evidence that Resolume or any other consumer received or followed it.
+
+Each configured module contributes a capability candidate (`process.supervise` or `timecode.ltc.observe`). Candidates are not advertised anywhere yet, because there is no coordinator transport.
+
+## Using it
+
+The tray icon is the primary surface. The application has no dock icon on macOS (it runs under the `Accessory` activation policy) and hides rather than quits when the settings window is closed. The tray menu shows three live status lines (arming state, Resolume supervision, LTC observation) and offers:
+
+- Open settings.
+- Arm until cleared, Disarm until cleared, Clear override.
+- Quit ShowMesh Companion.
+
+A temporary override is saved on this computer and survives a restart. It outranks the configured arming policy in both directions.
+
+The settings window is where everything is configured. There is no configuration file to hand-edit.
+
+- Companion name and coordinator address.
+- Arming policy: Follow Show Night, Always armed, or Always disarmed.
+- Resolume supervision: on or off, plus the path to the Resolume Arena application.
+- LTC observation: on or off, plus the audio input device and the channel carrying LTC. The device list is refreshed every 2 seconds and can be refreshed on demand.
+- A live timecode readout at 10 Hz, with lock state, detected frame rate, drop-frame flag, frame age, and input level.
+
+Settings are validated when they are saved and again when they are loaded. A settings file that cannot be parsed, or that parses but holds unusable values, is kept aside as `settings.json.invalid`, and the application loads the previous saved generation if there is one, or defaults if there is not. The window says which happened.
+
+Two things in the UI are saved but do nothing yet. `Open at login` is stored and never acted on. Show Night state is always `unknown`, because no coordinator transport exists to report it, which means the Follow Show Night policy resolves to disarmed until an operator sets an override or picks Always armed.
 
 ## Development
 
@@ -22,6 +48,6 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run tauri dev
 ```
 
-The macOS deployment target is 11.0 (Big Sur). Windows 10 remains the required Windows floor. Those runtime floors still need packaged-artifact verification on real machines before release.
+The macOS deployment target is 11.0 (Big Sur). Windows 10 remains the required Windows floor. Neither floor has been verified with a packaged artifact on a real machine, and compilation is not evidence of platform support.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for boundaries and the planned runtime flow.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the runtime shape and the boundaries, and [docs/BENCH-VERIFICATION.md](docs/BENCH-VERIFICATION.md) for the hardware checklist.

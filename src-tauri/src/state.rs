@@ -59,12 +59,7 @@ impl StateStore {
             fs::rename(&path, &backup).map_err(|error| error.to_string())?;
         }
         match fs::rename(&staging, &path) {
-            Ok(()) => {
-                if backup.exists() {
-                    fs::remove_file(backup).map_err(|error| error.to_string())?;
-                }
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) => {
                 if backup.exists() {
                     let _ = fs::rename(&backup, &path);
@@ -133,5 +128,23 @@ mod tests {
     fn treats_a_missing_state_file_as_no_override() {
         let store = StateStore::new(temp_dir());
         assert_eq!(store.load().unwrap(), ArmingOverride::None);
+    }
+
+    #[test]
+    fn a_save_retains_the_previous_generation() {
+        let dir = temp_dir();
+        let store = StateStore::new(dir.clone());
+        store.save(ArmingOverride::DisarmUntilNextNight).unwrap();
+        assert!(!dir.join("state.json.previous").exists());
+
+        store.save(ArmingOverride::ArmUntilNightEnds).unwrap();
+
+        let backup = fs::read(dir.join("state.json.previous")).unwrap();
+        let previous: PersistedState = serde_json::from_slice(&backup).unwrap();
+        assert_eq!(
+            previous.arming_override,
+            ArmingOverride::DisarmUntilNextNight
+        );
+        assert_eq!(store.load().unwrap(), ArmingOverride::ArmUntilNightEnds);
     }
 }

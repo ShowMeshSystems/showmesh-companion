@@ -11,7 +11,6 @@ const NEAR_SILENCE_LEVEL: f32 = 0.02;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
 pub enum TimecodeState {
     Disabled,
     NotConfigured,
@@ -257,7 +256,6 @@ fn map_frame_rate(rate: ltc::FrameRate) -> Option<LtcFrameRate> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[allow(dead_code)]
 pub enum LtcFrameRate {
     #[serde(rename = "24")]
     Fps24,
@@ -273,22 +271,20 @@ pub enum LtcFrameRate {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
 pub enum ExpectedFrameRate {
     Unobserved,
+    #[allow(dead_code)]
     Known(LtcFrameRate),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
 pub enum FrameRateComparison {
     Match,
     Mismatch,
     UnknownExpectedUnobserved,
 }
 
-#[allow(dead_code)]
 pub fn compare_frame_rate(
     observed: LtcFrameRate,
     expected: ExpectedFrameRate,

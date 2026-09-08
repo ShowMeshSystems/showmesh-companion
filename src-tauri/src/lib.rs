@@ -29,9 +29,11 @@ const MENU_LINE_LIMIT: usize = 78;
 const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TIMECODE_TICK_INTERVAL: Duration = Duration::from_millis(100);
 const TIMECODE_STATUS_EVENT: &str = "timecode-status";
+const SNAPSHOT_EVENT: &str = "app-snapshot";
 
 struct AppState {
     settings: Mutex<AppSettings>,
+    settings_notice: Mutex<Option<String>>,
     settings_store: SettingsStore,
     state_store: StateStore,
     arming_override: Mutex<ArmingOverride>,
@@ -54,6 +56,7 @@ struct AppSnapshot {
     arming_reason: String,
     supervisor: SupervisorStatus,
     timecode: TimecodeStatus,
+    settings_notice: Option<String>,
 }
 
 impl AppState {
@@ -83,6 +86,11 @@ impl AppState {
             .map_err(|_| "supervisor lock is poisoned")?
             .clone();
         let timecode = self.timecode_status(&settings.timecode);
+        let settings_notice = self
+            .settings_notice
+            .lock()
+            .map_err(|_| "settings-notice lock is poisoned")?
+            .clone();
 
         Ok(AppSnapshot {
             settings,
@@ -93,6 +101,7 @@ impl AppState {
             arming_reason: arming.reason,
             supervisor,
             timecode,
+            settings_notice,
         })
     }
 
@@ -262,6 +271,10 @@ fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<Ap
     state.settings_store.save(&settings)?;
     state.reconfigure_capture(&settings.timecode);
     *state
+        .settings_notice
+        .lock()
+        .map_err(|_| "settings-notice lock is poisoned")? = None;
+    *state
         .settings
         .lock()
         .map_err(|_| "settings lock is poisoned")? = settings;
@@ -290,9 +303,10 @@ pub fn run() {
                 .app_config_dir()
                 .map_err(|error| error.to_string())?;
             let settings_store = SettingsStore::new(config_dir.clone());
-            let settings = settings_store
+            let loaded = settings_store
                 .load()
                 .map_err(|error| format!("could not load settings: {error}"))?;
+            let settings = loaded.settings;
             let state_store = StateStore::new(config_dir);
             let arming_override = state_store
                 .load()
@@ -321,6 +335,7 @@ pub fn run() {
             );
             app.manage(AppState {
                 settings: Mutex::new(settings),
+                settings_notice: Mutex::new(loaded.notice),
                 settings_store,
                 state_store,
                 arming_override: Mutex::new(arming_override),
@@ -413,6 +428,7 @@ mod tests {
         ));
         AppState {
             settings: Mutex::new(AppSettings::default()),
+            settings_notice: Mutex::new(None),
             settings_store: SettingsStore::new(dir.clone()),
             state_store: StateStore::new(dir),
             arming_override: Mutex::new(ArmingOverride::None),
