@@ -52,7 +52,7 @@ h3 { margin-bottom: 4px; font-size: 15px; }
 .state-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-muted); }
 .arm-state.armed .state-dot { background: var(--success); box-shadow: 0 0 0 4px color-mix(in srgb, var(--success) 14%, transparent); }
 
-.status-band { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px 24px; margin-bottom: 32px; padding: 20px 24px; border-radius: var(--radius); background: var(--status-surface); color: var(--status-text); box-shadow: var(--shadow); }
+.status-band { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px 24px; margin-bottom: 32px; padding: 20px 24px; border-radius: var(--radius); background: var(--status-surface); color: var(--status-text); box-shadow: var(--shadow); }
 .status-band div { display: grid; gap: 4px; }
 .status-band span { color: var(--status-muted); }
 .status-band strong { font-variant-numeric: tabular-nums; text-transform: capitalize; }
@@ -66,7 +66,7 @@ form { display: grid; gap: 16px; }
 .field-grid.compact { grid-template-columns: 1fr 120px; }
 label:not(.check, .switch, .segmented label) { display: grid; gap: 8px; }
 label > span { font-weight: 600; }
-input[type="text"], input[type="url"], input[type="number"], input:not([type]) { width: 100%; height: 40px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); background: var(--surface-raised); }
+input[type="text"], input[type="url"], input[type="number"], input:not([type]), select { width: 100%; height: 40px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); background: var(--surface-raised); }
 input::placeholder { color: var(--text-muted); opacity: .75; }
 .check { display: flex; align-items: start; gap: 12px; margin-top: 20px; }
 .check span { display: grid; }
@@ -92,6 +92,24 @@ input::placeholder { color: var(--text-muted); opacity: .75; }
 .switch input:checked + span::after { transform: translateX(14px); }
 .switch input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 2px; }
 .module-notice { margin: 12px 0 0; padding: 12px; border-radius: var(--radius); color: var(--warning-text); background: var(--warning-bg); font-size: 12px; }
+.device-actions { margin-top: 12px; }
+
+.timecode-live { margin-top: 16px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--status-surface); }
+.timecode-value { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-variant-numeric: tabular-nums; font-size: 32px; font-weight: 650; letter-spacing: .02em; color: var(--status-text); }
+.timecode-live[data-state="locked"] .timecode-value { color: var(--success); }
+.timecode-live[data-state="no-lock"] .timecode-value,
+.timecode-live[data-state="no-audio"] .timecode-value { color: var(--status-muted); }
+.timecode-live[data-state="decode-failed"] .timecode-value { color: var(--danger); }
+.timecode-meta { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px 16px; margin: 14px 0 0; padding: 14px 0 0; border-top: 1px solid var(--status-border); }
+.timecode-meta div { display: grid; gap: 2px; }
+.timecode-meta dt { margin: 0; color: var(--status-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.timecode-meta dd { margin: 0; font-size: 12px; color: var(--status-text); font-variant-numeric: tabular-nums; text-transform: capitalize; }
+.timecode-live .module-notice { color: var(--status-text); background: color-mix(in srgb, var(--status-border) 55%, transparent); }
+.timecode-caveat { margin: 12px 0 0; color: var(--status-muted); font-size: 11px; }
+.detail-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px 16px; margin: 12px 0 0; padding: 0; }
+.detail-grid div { display: grid; gap: 2px; }
+.detail-grid dt { margin: 0; color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.detail-grid dd { margin: 0; font-size: 12px; font-variant-numeric: tabular-nums; text-transform: capitalize; }
 
 .capabilities { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--border); }
 .capabilities li { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid var(--border); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }

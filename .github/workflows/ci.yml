@@ -9,7 +9,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, windows-2022]
+        include:
+          - os: macos-15
+            allow-failure: false
+          - os: windows-2022
+            allow-failure: true
+    # Windows is deferred: its job runs for information and may fail.
+    continue-on-error: ${{ matrix.allow-failure }}
     runs-on: ${{ matrix.os }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"

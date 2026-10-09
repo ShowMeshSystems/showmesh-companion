@@ -48,10 +48,10 @@ pub fn resolve(
 ) -> ArmingDecision {
     match override_value {
         ArmingOverride::ArmUntilNightEnds => {
-            return decision(true, "Tray override: armed until this Show Night ends.");
+            return decision(true, "Manual override: armed.");
         }
         ArmingOverride::DisarmUntilNextNight => {
-            return decision(false, "Tray override: disarmed until the next Show Night.");
+            return decision(false, "Manual override: disarmed.");
         }
         ArmingOverride::None => {}
     }
@@ -81,7 +81,6 @@ pub fn resolve(
     }
 }
 
-#[allow(dead_code)]
 pub fn expire_override(
     previous: NightSessionState,
     next: NightSessionState,
