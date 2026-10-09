@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,6 +48,7 @@ pub struct CaptureState {
     last_sample_at_ms: AtomicU64,
     last_frame_at_ms: AtomicU64,
     level_bits: AtomicU32,
+    stream_failed: AtomicBool,
     infrequent: Mutex<Infrequent>,
 }
 
@@ -58,6 +59,7 @@ impl CaptureState {
             last_sample_at_ms: AtomicU64::new(0),
             last_frame_at_ms: AtomicU64::new(0),
             level_bits: AtomicU32::new(0f32.to_bits()),
+            stream_failed: AtomicBool::new(false),
             infrequent: Mutex::new(Infrequent::default()),
         }
     }
@@ -67,6 +69,7 @@ impl CaptureState {
         self.last_sample_at_ms.store(0, Ordering::Relaxed);
         self.last_frame_at_ms.store(0, Ordering::Relaxed);
         self.level_bits.store(0f32.to_bits(), Ordering::Relaxed);
+        self.stream_failed.store(false, Ordering::Relaxed);
         if let Ok(mut guard) = self.infrequent.lock() {
             guard.last_frame = None;
             guard.detected_rate = FrameRate::Unknown;
@@ -79,6 +82,7 @@ impl CaptureState {
         self.last_sample_at_ms.store(0, Ordering::Relaxed);
         self.last_frame_at_ms.store(0, Ordering::Relaxed);
         self.level_bits.store(0f32.to_bits(), Ordering::Relaxed);
+        self.stream_failed.store(false, Ordering::Relaxed);
         if let Ok(mut guard) = self.infrequent.lock() {
             guard.last_frame = None;
             guard.detected_rate = FrameRate::Unknown;
@@ -109,9 +113,14 @@ impl CaptureState {
 
     // Called only from the realtime error callback: non-blocking, non-allocating.
     fn publish_error(&self, message: &'static str) {
+        self.stream_failed.store(true, Ordering::Relaxed);
         if let Ok(mut guard) = self.infrequent.try_lock() {
             guard.stream_error = Some(message.to_string());
         }
+    }
+
+    fn take_stream_failure(&self) -> bool {
+        self.stream_failed.swap(false, Ordering::Relaxed)
     }
 
     pub fn observation(&self) -> CaptureObservation {
@@ -220,6 +229,10 @@ fn run(command_rx: mpsc::Receiver<CaptureCommand>, shared: Arc<CaptureState>) {
             }
             Ok(CaptureCommand::Shutdown) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A stream that reported an error is dropped here and reopened below.
+                if shared.take_stream_failure() {
+                    stream = None;
+                }
                 if let Some(target) = &current
                     && stream.is_none()
                 {
@@ -337,9 +350,11 @@ impl CallbackState {
         self.smoothed_level += (peak - self.smoothed_level) * LEVEL_SMOOTHING;
         self.shared.publish_sample(self.smoothed_level);
 
-        if let Some(&frame) = self.frame_out.last() {
+        for frame in &self.frame_out {
             self.rate_detector
                 .push(frame.sample_index, frame.drop_frame);
+        }
+        if let Some(&frame) = self.frame_out.last() {
             let rate = self.rate_detector.detect(self.sample_rate);
             self.shared.publish_frame(frame, rate);
         }
@@ -428,4 +443,67 @@ fn build_stream(
         .map_err(|error| BuildError::PlayFailed(error.to_string()))?;
 
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ltc::tests::generate_ltc;
+
+    fn observe_through_callback(buffer_len: usize) -> CaptureObservation {
+        let samples = generate_ltc(
+            (1, 0, 0, 0),
+            false,
+            120,
+            30.0,
+            30,
+            48000,
+            1.0,
+            0.5,
+            0.0,
+            false,
+            0.0,
+            1,
+        );
+        let shared = Arc::new(CaptureState::new());
+        let mut state = CallbackState::new(0, 1, 48000, Arc::clone(&shared));
+        for buffer in samples.chunks(buffer_len) {
+            state.handle(buffer, |sample| sample);
+        }
+        shared.observation()
+    }
+
+    #[test]
+    fn the_rate_is_detected_when_a_callback_buffer_holds_more_than_one_frame() {
+        for buffer_len in [512, 1920, 2000, 2048, 4800] {
+            let observation = observe_through_callback(buffer_len);
+            assert_eq!(
+                observation.detected_rate,
+                FrameRate::Fps30,
+                "buffer of {buffer_len} samples"
+            );
+            let frame = observation.last_frame.expect("a frame was published");
+            assert_eq!(
+                (frame.hours, frame.minutes, frame.seconds, frame.frames),
+                (1, 0, 3, 28),
+                "buffer of {buffer_len} samples"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_error_is_taken_once_and_cleared_by_a_restart() {
+        let shared = CaptureState::new();
+        assert!(!shared.take_stream_failure());
+
+        shared.publish_error("The audio input stream reported an error.");
+        assert!(shared.observation().stream_error.is_some());
+        assert!(shared.take_stream_failure());
+        assert!(!shared.take_stream_failure());
+
+        shared.publish_error("The audio input stream reported an error.");
+        shared.mark_started();
+        assert!(!shared.take_stream_failure());
+        assert!(shared.observation().stream_error.is_none());
+    }
 }
