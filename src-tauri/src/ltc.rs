@@ -1,9 +1,15 @@
 const SYNC_WORD: u16 = 0b0011_1111_1111_1101;
 const MASK80: u128 = (1u128 << 80) - 1;
 const BOOTSTRAP_EDGES: u32 = 180;
+const SHORT_MIN_RATIO: f32 = 0.5;
 const SHORT_MAX_RATIO: f32 = 1.5;
 const LONG_MAX_RATIO: f32 = 2.6;
 const LONG_MIN_RATIO: f32 = 1.5;
+const HALF_BITS_PER_FRAME: f32 = 160.0;
+const FASTEST_FRAME_RATE: f32 = 30.0;
+const SLOWEST_FRAME_RATE: f32 = 24.0;
+const SPEED_TOLERANCE: f32 = 0.2;
+const REACQUIRE_AFTER_FRAMES: f32 = 4.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frame {
@@ -28,6 +34,7 @@ pub struct Decoder {
     pending_half: Option<f32>,
     bits: u128,
     bit_count: u64,
+    last_lock_index: u64,
 }
 
 impl Decoder {
@@ -45,7 +52,24 @@ impl Decoder {
             pending_half: None,
             bits: 0,
             bit_count: 0,
+            last_lock_index: 0,
         }
+    }
+
+    // The half-bit lengths, in samples, that LTC at a supported frame rate can have.
+    fn half_bit_bounds(&self) -> (f32, f32) {
+        let per_second = self.sample_rate as f32 / HALF_BITS_PER_FRAME;
+        (
+            per_second / FASTEST_FRAME_RATE * (1.0 - SPEED_TOLERANCE),
+            per_second / SLOWEST_FRAME_RATE * (1.0 + SPEED_TOLERANCE),
+        )
+    }
+
+    fn restart_bootstrap(&mut self) {
+        self.nominal_half = None;
+        self.bootstrap_min = f32::MAX;
+        self.bootstrap_count = 0;
+        self.reset_frame_sync();
     }
 
     fn reset_frame_sync(&mut self) {
@@ -58,19 +82,34 @@ impl Decoder {
         if d <= 0.0 {
             return;
         }
+        let (shortest, longest) = self.half_bit_bounds();
+        // An estimate that has produced no frame for this long is wrong: measure again.
+        let reacquire_after = self.sample_rate as f32 / SLOWEST_FRAME_RATE * REACQUIRE_AFTER_FRAMES;
+        if self.nominal_half.is_some()
+            && index.saturating_sub(self.last_lock_index) as f32 > reacquire_after
+        {
+            self.restart_bootstrap();
+        }
         let nominal = match self.nominal_half {
             None => {
-                self.bootstrap_min = self.bootstrap_min.min(d);
+                if d >= shortest {
+                    self.bootstrap_min = self.bootstrap_min.min(d);
+                }
                 self.bootstrap_count += 1;
                 if self.bootstrap_count >= BOOTSTRAP_EDGES {
-                    self.nominal_half = Some(self.bootstrap_min * 1.05);
+                    let estimate = self.bootstrap_min * 1.05;
+                    self.restart_bootstrap();
+                    if estimate <= longest {
+                        self.nominal_half = Some(estimate);
+                        self.last_lock_index = index;
+                    }
                 }
                 return;
             }
             Some(n) => n,
         };
         let ratio = d / nominal;
-        if ratio < SHORT_MAX_RATIO {
+        if (SHORT_MIN_RATIO..SHORT_MAX_RATIO).contains(&ratio) {
             match self.pending_half {
                 None => {
                     self.pending_half = Some(d);
@@ -79,7 +118,7 @@ impl Decoder {
                     self.pending_half = None;
                     self.push_bit(1, index, out);
                     let new_nominal = nominal * 0.95 + d * 0.05;
-                    self.nominal_half = Some(new_nominal);
+                    self.nominal_half = Some(new_nominal.clamp(shortest, longest));
                 }
             }
         } else if (LONG_MIN_RATIO..=LONG_MAX_RATIO).contains(&ratio) {
@@ -89,7 +128,7 @@ impl Decoder {
             }
             self.push_bit(0, index, out);
             let new_nominal = nominal * 0.95 + (d * 0.5) * 0.05;
-            self.nominal_half = Some(new_nominal);
+            self.nominal_half = Some(new_nominal.clamp(shortest, longest));
         } else {
             self.reset_frame_sync();
         }
@@ -105,6 +144,7 @@ impl Decoder {
             return;
         }
         if let Some(frame) = decode_payload(self.bits, index) {
+            self.last_lock_index = index;
             out.push(frame);
         }
     }
@@ -342,7 +382,7 @@ impl Default for RateDetector {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn feed_rate(
@@ -479,7 +519,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn generate_ltc(
+    pub(crate) fn generate_ltc(
         start: (u8, u8, u8, u8),
         drop: bool,
         num_frames: u32,
@@ -963,6 +1003,174 @@ mod tests {
             let mut dec = Decoder::new();
             let frames = dec.push(&samples, 48000);
             assert!(!frames.is_empty(), "no frames for start {h}:{m}:{s}:{f}");
+        }
+    }
+
+    fn timecodes(
+        start: (u8, u8, u8, u8),
+        count: u32,
+        fps_int: u32,
+        drop: bool,
+    ) -> Vec<(u8, u8, u8, u8)> {
+        let (mut h, mut m, mut s, mut f) = start;
+        let mut all = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            if i > 0 {
+                increment_tc(&mut h, &mut m, &mut s, &mut f, fps_int, drop);
+            }
+            all.push((h, m, s, f));
+        }
+        all
+    }
+
+    fn noise(seconds: f64, sample_rate: u32, amplitude: f32, seed: u32) -> Vec<f32> {
+        let mut rng = Lcg(seed | 1);
+        let len = (seconds * sample_rate as f64) as usize;
+        (0..len).map(|_| rng.next() * amplitude).collect()
+    }
+
+    // The stream's final frame has no closing edge unless something follows it,
+    // so a decoded run may end on the last frame or the one before it.
+    fn assert_exact_run(
+        decoded: &[Frame],
+        expected: &[(u8, u8, u8, u8)],
+        drop: bool,
+        min_frames: usize,
+        label: &str,
+    ) {
+        assert!(
+            decoded.len() >= min_frames && decoded.len() <= expected.len(),
+            "{label}: decoded {} frames, expected at least {min_frames} of {}",
+            decoded.len(),
+            expected.len()
+        );
+        let got: Vec<_> = decoded
+            .iter()
+            .map(|f| (f.hours, f.minutes, f.seconds, f.frames))
+            .collect();
+        let last = expected.len() - 1;
+        if got.last() == Some(&expected[last]) {
+            assert_eq!(got, expected[last + 1 - got.len()..], "{label}");
+        } else {
+            assert_eq!(got, expected[last - got.len()..last], "{label}");
+        }
+        assert!(decoded.iter().all(|f| f.drop_frame == drop), "{label}");
+    }
+
+    const NOISE_FLOOR: f32 = 1e-4;
+
+    fn every_rate(mut case: impl FnMut(&str, f64, u32, bool, u32)) {
+        for &fps_name in &["24", "25", "2997", "30"] {
+            for &drop in &[false, true] {
+                if fps_name != "2997" && drop {
+                    continue;
+                }
+                let (fps, fps_int) = fps_pair(fps_name);
+                for &sr in &[44100u32, 48000, 96000] {
+                    let label = format!("fps={fps_name} drop={drop} sr={sr}");
+                    case(&label, fps, fps_int, drop, sr);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn locks_onto_ltc_that_starts_after_input_noise() {
+        every_rate(|label, fps, fps_int, drop, sr| {
+            for &(noise_seconds, floor) in &[(0.05, NOISE_FLOOR), (1.0, NOISE_FLOOR), (4.0, 0.01)] {
+                let start = (0, 0, 59, fps_int as u8 - 6);
+                let mut samples = noise(noise_seconds, sr, floor, 21);
+                samples.extend(generate_ltc(
+                    start, drop, 40, fps, fps_int, sr, 1.0, 0.5, 0.0, false, floor, 22,
+                ));
+                let frames = Decoder::new().push(&samples, sr);
+                let expected = timecodes(start, 40, fps_int, drop);
+                let label = format!("{label} noise={noise_seconds}s floor={floor}");
+                assert_exact_run(&frames, &expected, drop, 28, &label);
+            }
+        });
+    }
+
+    #[test]
+    fn locks_again_when_ltc_returns_after_a_noisy_gap() {
+        every_rate(|label, fps, fps_int, drop, sr| {
+            for &gap_seconds in &[0.05, 2.0] {
+                let first_start = (9, 59, 59, fps_int as u8 - 6);
+                let second_start = (21, 9, 59, fps_int as u8 - 6);
+                let mut samples = generate_ltc(
+                    first_start,
+                    drop,
+                    30,
+                    fps,
+                    fps_int,
+                    sr,
+                    1.0,
+                    0.5,
+                    0.0,
+                    false,
+                    NOISE_FLOOR,
+                    23,
+                );
+                samples.extend(noise(gap_seconds, sr, NOISE_FLOOR, 24));
+                let second_begins = samples.len() as u64;
+                samples.extend(generate_ltc(
+                    second_start,
+                    drop,
+                    40,
+                    fps,
+                    fps_int,
+                    sr,
+                    1.0,
+                    0.5,
+                    0.0,
+                    false,
+                    NOISE_FLOOR,
+                    25,
+                ));
+                let frames = Decoder::new().push(&samples, sr);
+                let (before, after): (Vec<Frame>, Vec<Frame>) = frames
+                    .iter()
+                    .partition(|frame| frame.sample_index < second_begins);
+                let label = format!("{label} gap={gap_seconds}s");
+                let first = timecodes(first_start, 30, fps_int, drop);
+                assert_exact_run(&before, &first, drop, 24, &format!("{label} before gap"));
+                let second = timecodes(second_start, 40, fps_int, drop);
+                assert_exact_run(&after, &second, drop, 28, &format!("{label} after gap"));
+            }
+        });
+    }
+
+    #[test]
+    fn decodes_low_level_ltc_over_a_noise_floor() {
+        every_rate(|label, fps, fps_int, drop, sr| {
+            let start = (23, 59, 59, fps_int as u8 - 6);
+            let mut samples = noise(1.0, sr, NOISE_FLOOR, 26);
+            samples.extend(generate_ltc(
+                start,
+                drop,
+                40,
+                fps,
+                fps_int,
+                sr,
+                1.0,
+                0.002,
+                0.0,
+                false,
+                NOISE_FLOOR,
+                27,
+            ));
+            let frames = Decoder::new().push(&samples, sr);
+            let expected = timecodes(start, 40, fps_int, drop);
+            assert_exact_run(&frames, &expected, drop, 28, label);
+        });
+    }
+
+    #[test]
+    fn input_noise_alone_never_decodes_a_frame() {
+        for &sr in &[44100u32, 48000, 96000] {
+            let samples = noise(20.0, sr, NOISE_FLOOR, 28);
+            let frames = Decoder::new().push(&samples, sr);
+            assert!(frames.is_empty(), "sr={sr}: {frames:?}");
         }
     }
 
