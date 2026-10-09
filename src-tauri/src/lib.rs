@@ -202,19 +202,26 @@ impl AppState {
             .arming_override
             .lock()
             .map_err(|_| "arming-override lock is poisoned")?;
-        self.state_store
-            .save(value)
-            .map_err(|error| format!("Could not save the temporary override: {error}"))?;
-        *arming_override = value;
+        let saved = self.state_store.save(value);
+        // A disarm is honoured even when it cannot be saved; an arm is not.
+        let applied = saved.is_ok() || value == ArmingOverride::DisarmUntilNextNight;
+        if applied {
+            *arming_override = value;
+        }
         drop(arming_override);
         let snapshot = self.snapshot()?;
-        self.refresh_tray(
-            snapshot.effective_armed,
-            &snapshot.arming_reason,
-            &snapshot.supervisor.reason,
-            &snapshot.timecode.reason,
-        );
-        Ok(snapshot)
+        if applied {
+            self.refresh_tray(
+                snapshot.effective_armed,
+                &snapshot.arming_reason,
+                &snapshot.supervisor.reason,
+                &snapshot.timecode.reason,
+            );
+        }
+        match saved {
+            Ok(()) => Ok(snapshot),
+            Err(error) => Err(unsaved_override_message(value, &error)),
+        }
     }
 
     #[allow(dead_code)]
@@ -251,6 +258,21 @@ fn capture_target(settings: &TimecodeSettings) -> Option<CaptureTarget> {
     })
 }
 
+fn unsaved_override_message(value: ArmingOverride, error: &str) -> String {
+    let fact = match value {
+        ArmingOverride::DisarmUntilNextNight => {
+            "Relaunching is disarmed until the companion quits. The choice could not be saved, so disarm again after a restart"
+        }
+        ArmingOverride::ArmUntilNightEnds => {
+            "Relaunching was not armed. The choice could not be saved, so try again"
+        }
+        ArmingOverride::None => {
+            "The override was not cleared. The change could not be saved, so try again"
+        }
+    };
+    format!("{fact}: {error}")
+}
+
 fn menu_line(label: &str, reason: &str) -> String {
     let mut line = format!("{label}: {reason}");
     if line.chars().count() > MENU_LINE_LIMIT {
@@ -284,9 +306,17 @@ fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<Ap
 #[tauri::command]
 fn set_arming_override(
     value: ArmingOverride,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AppSnapshot, String> {
-    state.apply_override(value)
+    let result = state.apply_override(value);
+    // A disarm that could not be saved is still in force, so the window must show it.
+    if result.is_err()
+        && let Ok(snapshot) = state.snapshot()
+    {
+        let _ = app.emit(SNAPSHOT_EVENT, &snapshot);
+    }
+    result
 }
 
 #[tauri::command]
@@ -439,6 +469,61 @@ mod tests {
             device_cache: Arc::new(audio_devices::DeviceCache::new()),
             capture: CaptureManager::start(),
         }
+    }
+
+    fn temp_state_that_cannot_save() -> AppState {
+        let mut state = temp_state();
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let blocker = std::env::temp_dir().join(format!(
+            "showmesh-companion-lib-test-blocker-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        state.state_store = StateStore::new(blocker.join("config"));
+        state
+    }
+
+    #[test]
+    fn a_disarm_that_cannot_be_saved_still_stops_relaunching() {
+        let state = temp_state_that_cannot_save();
+        state.settings.lock().unwrap().arming_policy = arming::ArmingPolicy::AlwaysArmed;
+
+        let Err(message) = state.apply_override(ArmingOverride::DisarmUntilNextNight) else {
+            panic!("the failed save was not reported");
+        };
+
+        assert!(message.starts_with("Relaunching is disarmed until the companion quits"));
+        assert_eq!(
+            *state.arming_override.lock().unwrap(),
+            ArmingOverride::DisarmUntilNextNight
+        );
+        assert!(!state.snapshot().unwrap().effective_armed);
+    }
+
+    #[test]
+    fn an_arm_that_cannot_be_saved_is_not_applied() {
+        let state = temp_state_that_cannot_save();
+
+        let Err(message) = state.apply_override(ArmingOverride::ArmUntilNightEnds) else {
+            panic!("the failed save was not reported");
+        };
+
+        assert!(message.starts_with("Relaunching was not armed"));
+        assert_eq!(*state.arming_override.lock().unwrap(), ArmingOverride::None);
+        assert!(!state.snapshot().unwrap().effective_armed);
+    }
+
+    #[test]
+    fn clearing_a_disarm_that_cannot_be_saved_keeps_the_disarm() {
+        let state = temp_state_that_cannot_save();
+        *state.arming_override.lock().unwrap() = ArmingOverride::DisarmUntilNextNight;
+
+        assert!(state.apply_override(ArmingOverride::None).is_err());
+
+        assert_eq!(
+            *state.arming_override.lock().unwrap(),
+            ArmingOverride::DisarmUntilNextNight
+        );
     }
 
     #[test]
