@@ -3,6 +3,7 @@ mod audio_devices;
 mod capabilities;
 mod capture;
 mod coordinator;
+mod crash_reports;
 #[allow(dead_code)]
 mod ltc;
 mod settings;
@@ -18,8 +19,9 @@ use arming::{ArmingOverride, NightSessionState};
 use audio_devices::AudioInputDevice;
 use capture::{CaptureManager, CaptureTarget};
 use coordinator::{CoordinatorLink, CoordinatorStatus};
+use crash_reports::{CrashReportStatus, CrashReporter, UploadConfig};
 use serde::Serialize;
-use settings::{AppSettings, SettingsStore, TimecodeSettings};
+use settings::{AppSettings, Secret, SettingsStore, TimecodeSettings};
 use state::StateStore;
 use supervisor::{SupervisionState, SupervisorStatus};
 use sysinfo::System;
@@ -33,6 +35,7 @@ const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TIMECODE_TICK_INTERVAL: Duration = Duration::from_millis(100);
 const TIMECODE_STATUS_EVENT: &str = "timecode-status";
 const SNAPSHOT_EVENT: &str = "app-snapshot";
+const CRASH_REPORT_FIRST_SCAN_DELAY: Duration = Duration::from_secs(5);
 
 struct AppState {
     settings: Mutex<AppSettings>,
@@ -47,6 +50,7 @@ struct AppState {
     tray_handles: Mutex<Option<tray::TrayHandles>>,
     device_cache: Arc<audio_devices::DeviceCache>,
     capture: CaptureManager,
+    crash_reports: Mutex<CrashReportStatus>,
 }
 
 #[derive(Serialize)]
@@ -62,14 +66,24 @@ struct AppSnapshot {
     supervisor: SupervisorStatus,
     timecode: TimecodeStatus,
     settings_notice: Option<String>,
+    coordinator_token_set: bool,
+    crash_reports: CrashReportStatus,
 }
 
 impl AppState {
     fn snapshot(&self) -> Result<AppSnapshot, String> {
-        let settings = self
+        let mut settings = self
             .settings
             .lock()
             .map_err(|_| "settings lock is poisoned")?
+            .clone();
+        // The window never receives the token itself, only whether one is saved.
+        let coordinator_token_set = !settings.coordinator_token.is_empty();
+        settings.coordinator_token = Secret::default();
+        let crash_reports = self
+            .crash_reports
+            .lock()
+            .map_err(|_| "crash-report lock is poisoned")?
             .clone();
         let night_guard = self
             .night_state
@@ -113,6 +127,8 @@ impl AppState {
             supervisor,
             timecode,
             settings_notice,
+            coordinator_token_set,
+            crash_reports,
         })
     }
 
@@ -189,6 +205,11 @@ impl AppState {
         let _ = handles
             .timecode_item
             .set_text(menu_line("LTC", timecode_reason));
+        if let Ok(status) = self.crash_reports.lock() {
+            let _ = handles
+                .crash_report_item
+                .set_text(menu_line("Crash reports", &status.reason));
+        }
     }
 
     fn tray_handles(&self) -> Option<tray::TrayHandles> {
@@ -305,6 +326,48 @@ impl AppState {
         retargeted || night_changed || before != after
     }
 
+    fn upload_config(&self) -> Option<UploadConfig> {
+        let settings = self.settings.lock().ok()?;
+        Some(UploadConfig {
+            enabled: settings.crash_reports.enabled,
+            base_url: coordinator::normalize_base_url(&settings.coordinator_url),
+            token: settings.coordinator_token.expose().to_string(),
+            companion_id: crash_reports::normalize_companion_id(&settings.companion_name),
+            executable_prefix: crash_reports::executable_prefix(
+                &settings.resolume.application_path,
+            ),
+        })
+    }
+
+    /// Runs one crash-report scan. Returns true when the status changed.
+    fn scan_crash_reports(&self, reporter: &mut CrashReporter, agent: &ureq::Agent) -> bool {
+        let Some(config) = self.upload_config() else {
+            return false;
+        };
+        let status = reporter.scan(
+            &config,
+            &crash_reports::report_folders(),
+            capture::now_ms(),
+            &mut |report| {
+                crash_reports::upload(
+                    agent,
+                    &config.base_url,
+                    &config.token,
+                    &config.companion_id,
+                    report,
+                )
+            },
+        );
+        let Ok(mut current) = self.crash_reports.lock() else {
+            return false;
+        };
+        let changed = current.reason != status.reason
+            || current.sent_count != status.sent_count
+            || current.last_error != status.last_error;
+        *current = status;
+        changed
+    }
+
     fn apply_night_state(&self, next: NightSessionState) -> Result<(), String> {
         let mut night_state = self
             .night_state
@@ -368,7 +431,20 @@ fn get_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, String> {
 }
 
 #[tauri::command]
-fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<AppSnapshot, String> {
+fn save_settings(
+    mut settings: AppSettings,
+    clear_coordinator_token: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<AppSnapshot, String> {
+    // The window never holds the saved token, so a blank field means keep it.
+    if settings.coordinator_token.is_empty() && clear_coordinator_token != Some(true) {
+        settings.coordinator_token = state
+            .settings
+            .lock()
+            .map_err(|_| "settings lock is poisoned")?
+            .coordinator_token
+            .clone();
+    }
     settings.validate()?;
     state.settings_store.save(&settings)?;
     state.reconfigure_capture(&settings.timecode);
@@ -417,7 +493,7 @@ pub fn run() {
                 .load()
                 .map_err(|error| format!("could not load settings: {error}"))?;
             let settings = loaded.settings;
-            let state_store = StateStore::new(config_dir);
+            let state_store = StateStore::new(config_dir.clone());
             let arming_override = state_store
                 .load()
                 .map_err(|error| format!("could not load saved state: {error}"))?;
@@ -456,6 +532,7 @@ pub fn run() {
                 tray_handles: Mutex::new(None),
                 device_cache,
                 capture: CaptureManager::start(),
+                crash_reports: Mutex::new(CrashReportStatus::starting()),
             });
 
             app.state::<AppState>()
@@ -513,6 +590,22 @@ pub fn run() {
                 }
             });
 
+            let crash_handle: AppHandle = app.handle().clone();
+            std::thread::spawn(move || {
+                let agent = crash_reports::http_agent();
+                let mut reporter = CrashReporter::new(config_dir);
+                std::thread::sleep(CRASH_REPORT_FIRST_SCAN_DELAY);
+                loop {
+                    let state = crash_handle.state::<AppState>();
+                    if state.scan_crash_reports(&mut reporter, &agent)
+                        && let Ok(snapshot) = state.snapshot()
+                    {
+                        let _ = crash_handle.emit(SNAPSHOT_EVENT, &snapshot);
+                    }
+                    std::thread::sleep(crash_reports::SCAN_INTERVAL);
+                }
+            });
+
             let timecode_handle: AppHandle = app.handle().clone();
             std::thread::spawn(move || {
                 loop {
@@ -565,6 +658,7 @@ mod tests {
             tray_handles: Mutex::new(None),
             device_cache: Arc::new(audio_devices::DeviceCache::new()),
             capture: CaptureManager::start(),
+            crash_reports: Mutex::new(CrashReportStatus::starting()),
         }
     }
 
@@ -578,6 +672,19 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").unwrap();
         state.state_store = StateStore::new(blocker.join("config"));
         state
+    }
+
+    #[test]
+    fn the_snapshot_reports_a_saved_token_without_revealing_it() {
+        let state = temp_state();
+        state.settings.lock().unwrap().coordinator_token = Secret::new("smt_very_secret");
+
+        let snapshot = state.snapshot().unwrap();
+
+        assert!(snapshot.coordinator_token_set);
+        assert!(snapshot.settings.coordinator_token.is_empty());
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("very_secret"));
     }
 
     #[test]

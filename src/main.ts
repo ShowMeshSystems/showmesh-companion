@@ -7,10 +7,29 @@ type ArmingOverride = "none" | "arm-until-night-ends" | "disarm-until-next-night
 interface Settings {
   companionName: string;
   coordinatorUrl: string;
+  coordinatorToken: string;
   armingPolicy: ArmingPolicy;
   launchAtLogin: boolean;
   resolume: { enabled: boolean; applicationPath: string };
   timecode: { enabled: boolean; deviceId: string; channel: number };
+  crashReports: { enabled: boolean };
+}
+
+type CrashReportState =
+  | "disabled"
+  | "not-configured"
+  | "unavailable"
+  | "watching"
+  | "token-rejected"
+  | "coordinator-unreachable"
+  | "folder-unreadable";
+
+interface CrashReportStatus {
+  state: CrashReportState;
+  reason: string;
+  sentCount: number;
+  lastSentAtMs: number | null;
+  lastError: string | null;
 }
 
 interface AudioInputDevice {
@@ -73,6 +92,8 @@ interface Snapshot {
   };
   timecode: TimecodeStatus;
   settingsNotice: string | null;
+  coordinatorTokenSet: boolean;
+  crashReports: CrashReportStatus;
 }
 
 function requireAppRoot(): HTMLElement {
@@ -87,6 +108,7 @@ let snapshot: Snapshot | null = null;
 let draft: Settings | null = null;
 let error: string | null = null;
 let saving = false;
+let clearTokenDraft = false;
 let audioDevices: AudioInputDevice[] = [];
 let audioDevicesError: string | null = null;
 let audioDevicesLoading = false;
@@ -104,10 +126,12 @@ function readForm(): Settings | null {
   return {
     companionName: String(data.get("companionName") ?? ""),
     coordinatorUrl: String(data.get("coordinatorUrl") ?? ""),
+    coordinatorToken: String(data.get("coordinatorToken") ?? "").trim(),
     armingPolicy: String(data.get("armingPolicy")) as ArmingPolicy,
     launchAtLogin: data.has("launchAtLogin"),
     resolume: { enabled: data.has("resolumeEnabled"), applicationPath: String(data.get("applicationPath") ?? "") },
     timecode: { enabled: data.has("timecodeEnabled"), deviceId: String(data.get("deviceId") ?? ""), channel: Number(data.get("channel") ?? 1) },
+    crashReports: { enabled: data.has("crashReportsEnabled") },
   };
 }
 
@@ -116,6 +140,8 @@ function readForm(): Settings | null {
 function captureDraft(): void {
   const current = readForm();
   if (current) draft = current;
+  const clear = document.querySelector<HTMLInputElement>('input[name="clearCoordinatorToken"]');
+  if (clear) clearTokenDraft = clear.checked;
 }
 
 function render(): void {
@@ -149,6 +175,7 @@ function render(): void {
       <div><span>Process monitor</span><strong>${escapeHtml(snapshot.supervisor.state)}</strong></div>
       <div><span>LTC</span><strong id="status-timecode-state">${escapeHtml(snapshot.timecode.state)}</strong></div>
       <div><span>Coordinator</span><strong>${escapeHtml(coordinatorLabel(snapshot.coordinator.state))}</strong></div>
+      <div><span>Crash reports</span><strong>${escapeHtml(crashReportLabel(snapshot.crashReports.state))}</strong></div>
       <p>${escapeHtml(snapshot.armingReason)} ${escapeHtml(snapshot.coordinator.reason)}</p>
     </section>
 
@@ -158,7 +185,10 @@ function render(): void {
         <div class="field-grid">
           <label><span>Companion name</span><input name="companionName" required value="${escapeHtml(settings.companionName)}" /></label>
           <label><span>Coordinator address</span><input name="coordinatorUrl" type="url" placeholder="http://showmesh.local:8080" value="${escapeHtml(settings.coordinatorUrl)}" /></label>
+          <label><span>Coordinator token</span><input name="coordinatorToken" type="password" autocomplete="off" spellcheck="false" placeholder="${snapshot.coordinatorTokenSet ? "A token is saved. Leave blank to keep it." : "Paste a companion token"}" value="${escapeHtml(settings.coordinatorToken)}" /></label>
         </div>
+        ${snapshot.coordinatorTokenSet ? `<label class="check"><input name="clearCoordinatorToken" type="checkbox" ${clearTokenDraft ? "checked" : ""}/><span><strong>Remove the saved token</strong><small>The companion stops sending crash reports until a new token is saved.</small></span></label>` : ""}
+        <p class="module-notice">The token is used only to send crash reports. Issue one on the coordinator with the companion role. It is saved on this computer and is never shown again here.</p>
         <label class="check"><input name="launchAtLogin" type="checkbox" ${settings.launchAtLogin ? "checked" : ""}/><span><strong>Open at login</strong><small>This preference is saved, but the application does not register itself with the operating system yet.</small></span></label>
       </section>
 
@@ -202,6 +232,16 @@ function render(): void {
           </div>
           ${audioDevicesError ? `<p class="form-error" role="alert">${escapeHtml(audioDevicesError)}</p>` : ""}
           ${timecodeLive(snapshot.timecode)}
+        </article>
+        <article class="module">
+          <div class="module-title"><div><h3>Crash reports</h3><p>Send Resolume Arena crash reports from this Mac to the coordinator.</p></div><label class="switch"><input name="crashReportsEnabled" type="checkbox" ${settings.crashReports.enabled ? "checked" : ""}/><span aria-hidden="true"></span><b>Enabled</b></label></div>
+          <p class="module-notice">${escapeHtml(snapshot.crashReports.reason)}</p>
+          <dl class="detail-grid">
+            <div><dt>State</dt><dd>${escapeHtml(crashReportLabel(snapshot.crashReports.state))}</dd></div>
+            <div><dt>Sent</dt><dd>${snapshot.crashReports.sentCount}</dd></div>
+            <div><dt>Last sent</dt><dd>${snapshot.crashReports.lastSentAtMs === null ? "Never" : escapeHtml(new Date(snapshot.crashReports.lastSentAtMs).toLocaleString())}</dd></div>
+            <div><dt>Last problem</dt><dd>${snapshot.crashReports.lastError ? escapeHtml(snapshot.crashReports.lastError) : "None"}</dd></div>
+          </dl>
         </article>
       </section>
 
@@ -281,6 +321,18 @@ function coordinatorLabel(state: Snapshot["coordinator"]["state"]): string {
     case "never-connected": return "Not connected";
     case "connected": return "Connected";
     case "unreachable": return "Unreachable";
+  }
+}
+
+function crashReportLabel(state: CrashReportState): string {
+  switch (state) {
+    case "disabled": return "Off";
+    case "not-configured": return "Not configured";
+    case "unavailable": return "Not available";
+    case "watching": return "Watching";
+    case "token-rejected": return "Token rejected";
+    case "coordinator-unreachable": return "Coordinator unreachable";
+    case "folder-unreadable": return "Folder unreadable";
   }
 }
 
@@ -383,13 +435,17 @@ async function save(event: SubmitEvent): Promise<void> {
   if (!snapshot) return;
   const settings = readForm();
   if (!settings) return;
+  const clearCoordinatorToken =
+    document.querySelector<HTMLInputElement>('input[name="clearCoordinatorToken"]')?.checked ?? false;
   saving = true;
   draft = settings;
+  clearTokenDraft = clearCoordinatorToken;
   error = null;
   render();
   try {
-    snapshot = await invoke<Snapshot>("save_settings", { settings });
+    snapshot = await invoke<Snapshot>("save_settings", { settings, clearCoordinatorToken });
     draft = null;
+    clearTokenDraft = false;
   } catch (cause) {
     error = String(cause);
   }

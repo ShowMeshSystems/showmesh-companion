@@ -55,6 +55,21 @@ Run on either platform against a real coordinator, with the policy set to Follow
 | C5 | Arm until the night ends from the tray, then end the night on the coordinator. | The override clears when the night reaches stopped or inactive, and supervision disarms. |
 | C6 | Enter an address where nothing is listening. | The companion reports it cannot reach the coordinator, Show Night stays unknown, and supervision is disarmed. |
 
+## Crash reports
+
+Run on macOS 11 and a current macOS, against a real coordinator that serves `POST /api/v1/companion-reports`, with a token issued for a machine principal holding the `companion` role.
+
+| # | Check | Pass condition |
+| --- | --- | --- |
+| R1 | Save the coordinator address and token with Crash reports on, then copy a real Arena crash report (or any small text file named like `Arena-2026-10-14-205842.ips`) into `~/Library/Logs/DiagnosticReports`. Wait at least 35 seconds. | The tray and settings window show one more report sent. `showmeshctl companion-reports list` on the coordinator lists it under this companion's name, with the right file name and capture time. |
+| R2 | Quit and relaunch the companion. Wait 35 seconds. | The sent count is unchanged and the coordinator holds no duplicate. |
+| R3 | Let Resolume crash for real, or force-quit it in a way that writes a crash report, with the companion running. | The new report reaches the coordinator within about a minute and its content matches the file on disk. |
+| R4 | Stop the coordinator, add a crash report, wait one scan, then start the coordinator. | The companion reports the coordinator unreachable, then sends the report once the coordinator answers. |
+| R5 | Revoke the token on the coordinator, then add a crash report. | The companion reports the token rejected. After pasting a new token and saving, the report is sent. |
+| R6 | Reopen the settings window after saving a token. | The token field is empty and says a token is saved. Saving other changes with the field blank keeps the token working. Ticking Remove the saved token stops uploads and the module reports no token. |
+| R7 | **Risk: folder permissions.** On a current macOS, confirm the companion can list `~/Library/Logs/DiagnosticReports` without extra privacy permissions. | Reports are found. If the folder cannot be read, the module says so; record which macOS needs which permission. |
+| R8 | `ls -l` the settings file in the application config directory. | It is readable and writable only by its owner. |
+
 ## Audio and timecode
 
 Run on both platforms, with a real audio interface and a real LTC generator.

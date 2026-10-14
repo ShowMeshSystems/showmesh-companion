@@ -8,7 +8,7 @@ Everything described here is implemented and unit-tested. None of it has been ob
 
 The Tauri host owns settings, arming state, module lifecycle, and capability derivation. The webview is a local settings and status surface. Users should never need to construct or edit a configuration file.
 
-Four threads run beside the Tauri main thread.
+Four threads run beside the Tauri main thread, plus the coordinator poll and the crash report scanner described under Transport.
 
 - **The supervisor poll thread** wakes every 2 seconds. It reads settings, night state, and the arming override, resolves the arming decision, refreshes the process list, and runs one supervision tick. It also rewrites the four tray status lines. It never holds the tray handle lock while calling into the menu, because `set_text` blocks on the main thread and the main thread is where menu clicks are handled; holding the lock across that call deadlocked the application.
 - **The audio capture thread** owns the cpal input stream. It has to: a `cpal::Stream` is not `Send`, so it cannot be created on one thread and stored somewhere shared. The thread receives configure, disable, and shutdown commands over a channel, and on a 300 millisecond timeout it retries a stream that failed to open, so an interface that appears later is picked up without operator action.
@@ -58,13 +58,23 @@ On load, a file that will not parse, or that parses into values that fail valida
 
 ## Transport
 
-The companion reads from the coordinator and does not report to it.
+The companion reads Show Night from the coordinator and sends it one kind of report: Resolume crash reports.
 
-A fifth thread polls `GET /api/v1/night/session` on the configured address every 2 seconds, with a 3 second timeout. The route is open to unauthenticated reads, so the companion holds no credential. `session.state` maps one to one onto the companion's night states; a state the companion does not recognise is a failed poll, never a guess. The poll runs on its own thread so a slow coordinator cannot delay a supervision tick.
+A fifth thread polls `GET /api/v1/night/session` on the configured address every 2 seconds, with a 3 second timeout. The route is open to unauthenticated reads, so this poll sends no credential. `session.state` maps one to one onto the companion's night states; a state the companion does not recognise is a failed poll, never a guess. The poll runs on its own thread so a slow coordinator cannot delay a supervision tick.
 
 `CoordinatorLink` in `coordinator.rs` records the last observed state per address. A failed poll after a successful one holds that state and reports how long the coordinator has been silent. A failed poll before any success leaves the night unknown. Changing the address discards everything observed from the old one. The held state lives in memory only.
 
-Registration, health, capability advertisement, and observation reporting are not implemented. They need an enrollment model and explicit schemas in the core repository, and the domain model here must not depend on MQTT topics or any single broker library when they arrive.
+### Crash reports
+
+A sixth thread, in `crash_reports.rs`, scans for Resolume Arena crash reports every 30 seconds, starting 5 seconds after launch. It runs apart from the supervisor and the coordinator poll so a slow upload, with its 30 second timeout, can never delay a supervision tick or a Show Night read. It scans `~/Library/Logs/DiagnosticReports` and its `Retired` folder for files named after the executable in the configured application path (`Arena` for `Arena.app`), followed by `-` or `_`, ending in `.ips` or `.crash`. Each new file is hashed and sent to `POST /api/v1/companion-reports` with a bearer token, at most five per scan, oldest first.
+
+The token belongs to a coordinator principal with the `companion` role, which grants only `companion:report`. It is the companion's first credential, and it cannot change show configuration. It is stored in `settings.json`, written with owner-only permissions on macOS and Linux, wrapped in a type whose `Debug` output never shows it, and replaced with an empty string in every snapshot sent to the webview.
+
+Answers are classified by the coordinator's contract. 200 and 201 mean stored (201 new, 200 already held), and 400 and 413 mean refused. Both are recorded by content hash in `crash-reports.json` and never sent again. 401 and 403 mean the token is rejected, which stops the scan. Anything else, including no answer, is retried on the next scan. A lost or corrupt ledger costs only a resend, which the coordinator deduplicates by companion and hash. The companion id sent is the companion name mapped onto `[A-Za-z0-9._-]`, at most 64 characters.
+
+Disabled, not configured (no address or no token), not available on this platform, watching, token rejected, coordinator unreachable, and folder unreadable are distinct states in the tray and the settings window.
+
+Registration, health, capability advertisement, and other observation reporting are not implemented. They need an enrollment model and explicit schemas in the core repository, and the domain model here must not depend on MQTT topics or any single broker library when they arrive.
 
 ### Expected LTC frame rate
 
