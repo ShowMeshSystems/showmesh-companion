@@ -55,6 +55,11 @@ interface Snapshot {
   settings: Settings;
   capabilities: Array<{ id: string; version: number }>;
   nightState: string;
+  coordinator: {
+    state: "not-configured" | "never-connected" | "connected" | "unreachable";
+    reason: string;
+    holding: boolean;
+  };
   armingOverride: ArmingOverride;
   effectiveArmed: boolean;
   armingReason: string;
@@ -140,11 +145,11 @@ function render(): void {
     ${snapshot.settingsNotice ? `<p class="form-error" role="alert">${escapeHtml(snapshot.settingsNotice)}</p>` : ""}
 
     <section class="status-band" aria-label="Current state">
-      <div><span>Show Night</span><strong>${escapeHtml(snapshot.nightState)}</strong></div>
+      <div><span>Show Night</span><strong>${escapeHtml(snapshot.nightState)}${snapshot.coordinator.holding ? " (held)" : ""}</strong></div>
       <div><span>Process monitor</span><strong>${escapeHtml(snapshot.supervisor.state)}</strong></div>
       <div><span>LTC</span><strong id="status-timecode-state">${escapeHtml(snapshot.timecode.state)}</strong></div>
-      <div><span>Controller</span><strong>${settings.coordinatorUrl ? "Configured" : "Not configured"}</strong></div>
-      <p>${escapeHtml(snapshot.armingReason)}</p>
+      <div><span>Coordinator</span><strong>${escapeHtml(coordinatorLabel(snapshot.coordinator.state))}</strong></div>
+      <p>${escapeHtml(snapshot.armingReason)} ${escapeHtml(snapshot.coordinator.reason)}</p>
     </section>
 
     <form id="settings-form">
@@ -170,7 +175,7 @@ function render(): void {
           <button type="button" class="button secondary" data-override="disarm-until-next-night">Disarm until next night</button>
           <button type="button" class="button ghost" data-override="none">Clear</button>
         </div>
-        <p class="module-notice">A temporary override is saved on this computer and stays in force after a restart. Expiry depends on Show Night state, which has not been observed yet, so an override stays in force until it is cleared, either here or from the tray menu.</p>
+        <p class="module-notice">A temporary override is saved on this computer and stays in force after a restart. Arm for this night ends when the coordinator reports the night inactive or stopped. Disarm until next night ends when it reports the next night preparing. Without a coordinator, an override stays until you clear it here or from the tray menu.</p>
       </section>
 
       <section class="section modules">
@@ -268,6 +273,15 @@ function deviceOptions(devices: AudioInputDevice[], selectedId: string): string 
 function selectedDeviceChannelMax(devices: AudioInputDevice[], selectedId: string): string {
   const device = devices.find((candidate) => candidate.id === selectedId);
   return device?.channels ? `max="${device.channels}"` : "";
+}
+
+function coordinatorLabel(state: Snapshot["coordinator"]["state"]): string {
+  switch (state) {
+    case "not-configured": return "Not configured";
+    case "never-connected": return "Not connected";
+    case "connected": return "Connected";
+    case "unreachable": return "Unreachable";
+  }
 }
 
 function policyOption(value: ArmingPolicy, label: string, selected: ArmingPolicy): string {

@@ -14,6 +14,7 @@ const MENU_QUIT: &str = "quit";
 #[derive(Clone)]
 pub(crate) struct TrayHandles {
     pub armed_item: MenuItem<Wry>,
+    pub coordinator_item: MenuItem<Wry>,
     pub supervisor_item: MenuItem<Wry>,
     pub timecode_item: MenuItem<Wry>,
 }
@@ -23,6 +24,13 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
         app,
         "arming-state",
         "Reading arming state…",
+        false,
+        None::<&str>,
+    )?;
+    let coordinator_item = MenuItem::with_id(
+        app,
+        "coordinator-state",
+        "Reading coordinator connection…",
         false,
         None::<&str>,
     )?;
@@ -46,14 +54,14 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
     let arm_item = MenuItem::with_id(
         app,
         MENU_ARM_UNTIL_NIGHT_ENDS,
-        "Arm until cleared",
+        "Arm until the night ends",
         true,
         None::<&str>,
     )?;
     let disarm_item = MenuItem::with_id(
         app,
         MENU_DISARM_UNTIL_NEXT_NIGHT,
-        "Disarm until cleared",
+        "Disarm until the next night",
         true,
         None::<&str>,
     )?;
@@ -76,6 +84,7 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
         app,
         &[
             &armed_item,
+            &coordinator_item,
             &supervisor_item,
             &timecode_item,
             &PredefinedMenuItem::separator(app)?,
@@ -107,6 +116,7 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
 
     Ok(TrayHandles {
         armed_item,
+        coordinator_item,
         supervisor_item,
         timecode_item,
     })
