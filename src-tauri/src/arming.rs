@@ -113,7 +113,7 @@ fn decision(armed: bool, reason: &str) -> ArmingDecision {
 }
 
 impl NightSessionState {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Unknown => "state unknown",
             Self::Inactive => "inactive",

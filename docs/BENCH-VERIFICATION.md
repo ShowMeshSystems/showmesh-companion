@@ -42,6 +42,19 @@ Run the whole section twice: once on Windows 10, the deployment floor, and once 
 | W7 | Set a tray override, quit, relaunch. | The override is still in force. |
 | W8 | Make the configuration directory unwritable, then click a tray override. | The operator gets visible feedback that the override could not be saved. |
 
+## Coordinator
+
+Run on either platform against a real coordinator, with the policy set to Follow Show Night and Resolume supervision enabled.
+
+| # | Check | Pass condition |
+| --- | --- | --- |
+| C1 | Enter the coordinator address and save, with no night running. | Within a few seconds the tray and settings window show the coordinator connected and Show Night inactive, and supervision is disarmed. |
+| C2 | Start a night on the coordinator. | Show Night follows each state within a few seconds. Supervision arms at preparing. |
+| C3 | **Risk: coordinator loss mid-night.** With the night live, stop the coordinator or unplug its network. Quit Resolume. | The companion reports the coordinator unreachable and Show Night held at live, stays armed, and relaunches Resolume once. |
+| C4 | Bring the coordinator back. | The hold ends and Show Night tracks the coordinator again. |
+| C5 | Arm until the night ends from the tray, then end the night on the coordinator. | The override clears when the night reaches stopped or inactive, and supervision disarms. |
+| C6 | Enter an address where nothing is listening. | The companion reports it cannot reach the coordinator, Show Night stays unknown, and supervision is disarmed. |
+
 ## Audio and timecode
 
 Run on both platforms, with a real audio interface and a real LTC generator.
@@ -77,6 +90,6 @@ Per AGENTS.md, platform support cannot be claimed from compilation. Each row is 
 
 ## Known gaps that no check here can close
 
-- There is no coordinator transport. Night state is always unknown, so the Follow Show Night policy resolves to disarmed and override expiry never fires. Every arming check above is really a check of the override and policy paths.
-- The expected LTC frame rate is unobserved until the ShowMesh coordinator publishes the show's configured rate. Frame rate comparison therefore never reports a mismatch. That is intended, and it stays that way until the core repository change lands.
+- The companion does not report to the coordinator. ShowMesh cannot show its state.
+- The expected LTC frame rate is unobserved, because the coordinator only serves the show's configured rate to a `config:write` credential. Frame rate comparison therefore never reports a mismatch.
 - Capability candidates are derived but never advertised.

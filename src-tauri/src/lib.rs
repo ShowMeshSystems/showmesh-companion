@@ -2,6 +2,7 @@ mod arming;
 mod audio_devices;
 mod capabilities;
 mod capture;
+mod coordinator;
 #[allow(dead_code)]
 mod ltc;
 mod settings;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use arming::{ArmingOverride, NightSessionState};
 use audio_devices::AudioInputDevice;
 use capture::{CaptureManager, CaptureTarget};
+use coordinator::{CoordinatorLink, CoordinatorStatus};
 use serde::Serialize;
 use settings::{AppSettings, SettingsStore, TimecodeSettings};
 use state::StateStore;
@@ -25,6 +27,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use timecode::TimecodeStatus;
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const COORDINATOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MENU_LINE_LIMIT: usize = 78;
 const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TIMECODE_TICK_INTERVAL: Duration = Duration::from_millis(100);
@@ -38,6 +41,7 @@ struct AppState {
     state_store: StateStore,
     arming_override: Mutex<ArmingOverride>,
     night_state: Mutex<NightSessionState>,
+    coordinator: Mutex<CoordinatorLink>,
     supervisor: Mutex<SupervisorStatus>,
     supervision_runtime: Mutex<SupervisionState>,
     tray_handles: Mutex<Option<tray::TrayHandles>>,
@@ -51,6 +55,7 @@ struct AppSnapshot {
     settings: AppSettings,
     capabilities: Vec<capabilities::CapabilityCandidate>,
     night_state: NightSessionState,
+    coordinator: CoordinatorStatus,
     arming_override: ArmingOverride,
     effective_armed: bool,
     arming_reason: String,
@@ -86,6 +91,11 @@ impl AppState {
             .map_err(|_| "supervisor lock is poisoned")?
             .clone();
         let timecode = self.timecode_status(&settings.timecode);
+        let coordinator = self
+            .coordinator
+            .lock()
+            .map_err(|_| "coordinator lock is poisoned")?
+            .status(capture::now_ms());
         let settings_notice = self
             .settings_notice
             .lock()
@@ -96,6 +106,7 @@ impl AppState {
             settings,
             capabilities,
             night_state,
+            coordinator,
             arming_override,
             effective_armed: arming.armed,
             arming_reason: arming.reason,
@@ -137,9 +148,11 @@ impl AppState {
             Instant::now(),
         );
         let timecode = self.timecode_status(&settings.timecode);
+        let coordinator_reason = self.coordinator_reason();
         self.refresh_tray(
             decision.armed,
             &decision.reason,
+            &coordinator_reason,
             &status.reason,
             &timecode.reason,
         );
@@ -156,6 +169,7 @@ impl AppState {
         &self,
         armed: bool,
         arming_reason: &str,
+        coordinator_reason: &str,
         supervisor_reason: &str,
         timecode_reason: &str,
     ) {
@@ -166,6 +180,9 @@ impl AppState {
             "{}: {arming_reason}",
             if armed { "Armed" } else { "Disarmed" }
         ));
+        let _ = handles
+            .coordinator_item
+            .set_text(menu_line("Coordinator", coordinator_reason));
         let _ = handles
             .supervisor_item
             .set_text(menu_line("Resolume", supervisor_reason));
@@ -214,6 +231,7 @@ impl AppState {
             self.refresh_tray(
                 snapshot.effective_armed,
                 &snapshot.arming_reason,
+                &snapshot.coordinator.reason,
                 &snapshot.supervisor.reason,
                 &snapshot.timecode.reason,
             );
@@ -224,7 +242,69 @@ impl AppState {
         }
     }
 
-    #[allow(dead_code)]
+    fn coordinator_reason(&self) -> String {
+        self.coordinator
+            .lock()
+            .map(|link| link.status(capture::now_ms()).reason)
+            .unwrap_or_else(|_| "The coordinator connection state could not be read.".into())
+    }
+
+    /// Polls the coordinator once. Returns true when the night state or the
+    /// connection state changed, so the caller can push a fresh snapshot.
+    fn poll_coordinator(&self, agent: &ureq::Agent) -> bool {
+        let configured_url = match self.settings.lock() {
+            Ok(guard) => guard.coordinator_url.clone(),
+            Err(_) => return false,
+        };
+        let (base_url, retargeted, before) = {
+            let Ok(mut link) = self.coordinator.lock() else {
+                return false;
+            };
+            let before = link.status(0).state;
+            let retargeted = link.retarget(&configured_url);
+            (link.base_url().to_string(), retargeted, before)
+        };
+        if retargeted && let Ok(mut night) = self.night_state.lock() {
+            *night = NightSessionState::Unknown;
+        }
+        if base_url.is_empty() {
+            return retargeted;
+        }
+
+        let result = coordinator::fetch_night_session(agent, &base_url);
+        let night_changed = {
+            let Ok(mut link) = self.coordinator.lock() else {
+                return false;
+            };
+            if link.base_url() != base_url {
+                return true;
+            }
+            match result {
+                Ok(observed) => {
+                    link.record_success(observed);
+                    drop(link);
+                    let previous = self.night_state.lock().map(|night| *night).ok();
+                    let changed = previous != Some(observed);
+                    if changed {
+                        // The night state applies even when the expired override cannot be saved.
+                        let _ = self.apply_night_state(observed);
+                    }
+                    changed
+                }
+                Err(error) => {
+                    link.record_failure(error, capture::now_ms());
+                    false
+                }
+            }
+        };
+        let after = self
+            .coordinator
+            .lock()
+            .map(|link| link.status(0).state)
+            .unwrap_or(before);
+        retargeted || night_changed || before != after
+    }
+
     fn apply_night_state(&self, next: NightSessionState) -> Result<(), String> {
         let mut night_state = self
             .night_state
@@ -370,6 +450,7 @@ pub fn run() {
                 state_store,
                 arming_override: Mutex::new(arming_override),
                 night_state: Mutex::new(NightSessionState::Unknown),
+                coordinator: Mutex::new(CoordinatorLink::default()),
                 supervisor: Mutex::new(initial_status.clone()),
                 supervision_runtime: Mutex::new(initial_runtime),
                 tray_handles: Mutex::new(None),
@@ -392,6 +473,7 @@ pub fn run() {
             app.state::<AppState>().refresh_tray(
                 decision.armed,
                 &decision.reason,
+                &app.state::<AppState>().coordinator_reason(),
                 &initial_status.reason,
                 &initial_timecode.reason,
             );
@@ -414,6 +496,20 @@ pub fn run() {
                     std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
                     let state = handle.state::<AppState>();
                     state.poll_supervisor(&mut system);
+                }
+            });
+
+            let coordinator_handle: AppHandle = app.handle().clone();
+            std::thread::spawn(move || {
+                let agent = coordinator::http_agent();
+                loop {
+                    let state = coordinator_handle.state::<AppState>();
+                    if state.poll_coordinator(&agent)
+                        && let Ok(snapshot) = state.snapshot()
+                    {
+                        let _ = coordinator_handle.emit(SNAPSHOT_EVENT, &snapshot);
+                    }
+                    std::thread::sleep(COORDINATOR_POLL_INTERVAL);
                 }
             });
 
@@ -463,6 +559,7 @@ mod tests {
             state_store: StateStore::new(dir),
             arming_override: Mutex::new(ArmingOverride::None),
             night_state: Mutex::new(NightSessionState::Unknown),
+            coordinator: Mutex::new(CoordinatorLink::default()),
             supervisor: Mutex::new(SupervisorStatus::not_configured()),
             supervision_runtime: Mutex::new(SupervisionState::default()),
             tray_handles: Mutex::new(None),
@@ -523,6 +620,124 @@ mod tests {
         assert_eq!(
             *state.arming_override.lock().unwrap(),
             ArmingOverride::DisarmUntilNextNight
+        );
+    }
+
+    /// Serves one canned night-session answer per accepted connection, then closes.
+    fn coordinator_answering(states: &'static [&'static str]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for state in states {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let body = format!(
+                    r#"{{"serverTime":"2026-10-14T18:00:00Z","session":{{"state":"{state}"}}}}"#
+                );
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        address
+    }
+
+    fn following(state: &AppState, address: &str) {
+        let mut settings = state.settings.lock().unwrap();
+        settings.coordinator_url = address.to_string();
+        settings.arming_policy = arming::ArmingPolicy::FollowShowNight;
+    }
+
+    #[test]
+    fn a_live_night_on_the_coordinator_arms_supervision() {
+        let state = temp_state();
+        following(&state, &coordinator_answering(&["live"]));
+
+        assert!(state.poll_coordinator(&coordinator::http_agent()));
+
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.night_state, NightSessionState::Live);
+        assert!(snapshot.effective_armed);
+        assert_eq!(
+            snapshot.coordinator.state,
+            coordinator::LinkState::Connected
+        );
+    }
+
+    #[test]
+    fn losing_the_coordinator_mid_night_keeps_supervision_armed() {
+        let state = temp_state();
+        following(&state, &coordinator_answering(&["live"]));
+        let agent = coordinator::http_agent();
+        state.poll_coordinator(&agent);
+
+        assert!(state.poll_coordinator(&agent));
+
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.night_state, NightSessionState::Live);
+        assert!(snapshot.effective_armed);
+        assert_eq!(
+            snapshot.coordinator.state,
+            coordinator::LinkState::Unreachable
+        );
+        assert!(snapshot.coordinator.holding);
+    }
+
+    #[test]
+    fn a_coordinator_never_reached_leaves_supervision_disarmed() {
+        let state = temp_state();
+        following(&state, &coordinator_answering(&[]));
+
+        state.poll_coordinator(&coordinator::http_agent());
+
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.night_state, NightSessionState::Unknown);
+        assert!(!snapshot.effective_armed);
+        assert_eq!(
+            snapshot.coordinator.state,
+            coordinator::LinkState::NeverConnected
+        );
+    }
+
+    #[test]
+    fn the_night_ending_on_the_coordinator_expires_an_arm_override() {
+        let state = temp_state();
+        following(&state, &coordinator_answering(&["fading-out", "stopped"]));
+        let agent = coordinator::http_agent();
+        state.poll_coordinator(&agent);
+        state
+            .apply_override(ArmingOverride::ArmUntilNightEnds)
+            .unwrap();
+
+        state.poll_coordinator(&agent);
+
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.night_state, NightSessionState::Stopped);
+        assert_eq!(snapshot.arming_override, ArmingOverride::None);
+        assert!(!snapshot.effective_armed);
+    }
+
+    #[test]
+    fn clearing_the_coordinator_address_drops_the_held_state() {
+        let state = temp_state();
+        following(&state, &coordinator_answering(&["live"]));
+        state.poll_coordinator(&coordinator::http_agent());
+
+        state.settings.lock().unwrap().coordinator_url.clear();
+        assert!(state.poll_coordinator(&coordinator::http_agent()));
+
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.night_state, NightSessionState::Unknown);
+        assert!(!snapshot.effective_armed);
+        assert_eq!(
+            snapshot.coordinator.state,
+            coordinator::LinkState::NotConfigured
         );
     }
 
