@@ -1,6 +1,6 @@
 [package]
 name = "showmesh-companion"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local process supervision and timecode evidence for ShowMesh"
 authors = ["ShowMesh Systems"]
 license = "Apache-2.0"
