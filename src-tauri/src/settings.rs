@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fmt, fs, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,10 +9,54 @@ use crate::arming::ArmingPolicy;
 pub struct AppSettings {
     pub companion_name: String,
     pub coordinator_url: String,
+    pub coordinator_token: Secret,
     pub arming_policy: ArmingPolicy,
     pub launch_at_login: bool,
     pub resolume: ResolumeSettings,
     pub timecode: TimecodeSettings,
+    pub crash_reports: CrashReportSettings,
+}
+
+/// A credential that never appears in `Debug` output, so it cannot reach a log.
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    #[cfg(test)]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(if self.0.is_empty() {
+            "<empty>"
+        } else {
+            "<set>"
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CrashReportSettings {
+    pub enabled: bool,
+}
+
+impl Default for CrashReportSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -35,10 +79,12 @@ impl Default for AppSettings {
         Self {
             companion_name: "ShowMesh Companion".into(),
             coordinator_url: String::new(),
+            coordinator_token: Secret::default(),
             arming_policy: ArmingPolicy::FollowShowNight,
             launch_at_login: true,
             resolume: ResolumeSettings::default(),
             timecode: TimecodeSettings::default(),
+            crash_reports: CrashReportSettings::default(),
         }
     }
 }
@@ -63,6 +109,12 @@ impl AppSettings {
                 || self.coordinator_url.starts_with("https://"))
         {
             return Err("Coordinator address must begin with http:// or https://.".into());
+        }
+        let token = self.coordinator_token.expose();
+        if token.len() > 4096 || !token.chars().all(|character| character.is_ascii_graphic()) {
+            return Err(
+                "The coordinator token must be pasted exactly as issued, with no spaces.".into(),
+            );
         }
         if self.resolume.enabled && self.resolume.application_path.trim().is_empty() {
             return Err(
@@ -150,6 +202,7 @@ impl SettingsStore {
         let backup = self.directory.join("settings.json.previous");
         let bytes = serde_json::to_vec_pretty(settings).map_err(|error| error.to_string())?;
         fs::write(&staging, bytes).map_err(|error| error.to_string())?;
+        restrict_to_owner(&staging)?;
         if path.exists() {
             if backup.exists() {
                 fs::remove_file(&backup).map_err(|error| error.to_string())?;
@@ -166,6 +219,18 @@ impl SettingsStore {
             }
         }
     }
+}
+
+/// The settings file holds the coordinator token, so only this user may read it.
+#[cfg(unix)]
+fn restrict_to_owner(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -200,6 +265,48 @@ mod tests {
             settings.validate().unwrap_err(),
             "Choose an audio input before enabling LTC observation."
         );
+    }
+
+    #[test]
+    fn a_token_with_whitespace_is_rejected() {
+        let settings = AppSettings {
+            coordinator_token: Secret::new("abc def"),
+            ..AppSettings::default()
+        };
+        assert!(settings.validate().unwrap_err().contains("token"));
+    }
+
+    #[test]
+    fn the_token_never_appears_in_debug_output() {
+        let settings = AppSettings {
+            coordinator_token: Secret::new("smt_very_secret"),
+            ..AppSettings::default()
+        };
+        let printed = format!("{settings:?}");
+        assert!(!printed.contains("very_secret"));
+        assert!(printed.contains("<set>"));
+    }
+
+    #[test]
+    fn settings_saved_before_crash_reports_existed_send_them() {
+        let settings: AppSettings = serde_json::from_str(r#"{"companionName":"Booth"}"#).unwrap();
+        assert!(settings.crash_reports.enabled);
+        assert!(settings.coordinator_token.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_saved_settings_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        SettingsStore::new(dir.clone())
+            .save(&AppSettings::default())
+            .unwrap();
+        let mode = fs::metadata(dir.join("settings.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

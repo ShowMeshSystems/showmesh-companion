@@ -17,6 +17,7 @@ pub(crate) struct TrayHandles {
     pub coordinator_item: MenuItem<Wry>,
     pub supervisor_item: MenuItem<Wry>,
     pub timecode_item: MenuItem<Wry>,
+    pub crash_report_item: MenuItem<Wry>,
 }
 
 pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
@@ -45,6 +46,13 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
         app,
         "timecode-state",
         "Reading LTC observation state…",
+        false,
+        None::<&str>,
+    )?;
+    let crash_report_item = MenuItem::with_id(
+        app,
+        "crash-report-state",
+        "Reading crash report upload state…",
         false,
         None::<&str>,
     )?;
@@ -87,6 +95,7 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
             &coordinator_item,
             &supervisor_item,
             &timecode_item,
+            &crash_report_item,
             &PredefinedMenuItem::separator(app)?,
             &open_settings_item,
             &PredefinedMenuItem::separator(app)?,
@@ -119,6 +128,7 @@ pub(crate) fn build(app: &AppHandle) -> tauri::Result<TrayHandles> {
         coordinator_item,
         supervisor_item,
         timecode_item,
+        crash_report_item,
     })
 }
 

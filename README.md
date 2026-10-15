@@ -12,12 +12,13 @@ Every module described below is implemented and covered by unit tests. None of i
 
 - **Resolume supervision.** A poll thread looks for a process matching the configured Resolume Arena path every 2 seconds. If the process is absent and the application is armed, it launches Resolume, waits for it to appear, and backs off after a failed attempt. It never kills, stops, or forcibly restarts anything, and it never will: that boundary is a project constraint, not a missing feature.
 - **LTC observation.** A capture thread opens the configured audio input, decodes LTC from the configured channel, and reports the observed frame, the detected frame rate, the input level, and how long ago the last frame decoded. This is evidence that this computer received timecode. It is never evidence that Resolume or any other consumer received or followed it.
+- **Crash reports (macOS).** Every 30 seconds a thread looks in `~/Library/Logs/DiagnosticReports` and its `Retired` folder for Resolume Arena crash reports (`.ips` and `.crash` files named after the Arena executable) and sends each new one to the coordinator. Each report is sent once: the content hashes the coordinator accepted or refused are kept in `crash-reports.json` in the application config directory. Files over 4 MB are not sent. On Windows and Linux the module reports that it is not available.
 
-Each configured module contributes a capability candidate (`process.supervise` or `timecode.ltc.observe`). Candidates are not advertised anywhere yet: the companion reads from the coordinator but does not report to it.
+Each configured module contributes a capability candidate (`process.supervise` or `timecode.ltc.observe`). Candidates are not advertised anywhere yet. The only thing the companion sends to the coordinator is crash reports.
 
 ## Using it
 
-The tray icon is the primary surface. The application has no dock icon on macOS (it runs under the `Accessory` activation policy) and hides rather than quits when the settings window is closed. The tray menu shows three live status lines (arming state, Resolume supervision, LTC observation) and offers:
+The tray icon is the primary surface. The application has no dock icon on macOS (it runs under the `Accessory` activation policy) and hides rather than quits when the settings window is closed. The tray menu shows live status lines (arming state, coordinator connection, Resolume supervision, LTC observation, crash reports) and offers:
 
 - Open settings.
 - Arm until the night ends, Disarm until the next night, Clear override.
@@ -27,11 +28,12 @@ A temporary override is saved on this computer and survives a restart. It outran
 
 The settings window is where everything is configured. There is no configuration file to hand-edit.
 
-- Companion name and coordinator address.
+- Companion name, coordinator address, and coordinator token.
 - Arming policy: Follow Show Night, Always armed, or Always disarmed.
 - Resolume supervision: on or off, plus the path to the Resolume Arena application.
 - LTC observation: on or off, plus the audio input device and the channel carrying LTC. The device list is refreshed every 2 seconds and can be refreshed on demand.
 - A live timecode readout at 10 Hz, with lock state, detected frame rate, drop-frame flag, frame age, and input level.
+- Crash reports: on or off (on by default), with the number sent, when the last one was sent, and the last problem.
 
 Settings are validated when they are saved and again when they are loaded. A settings file that cannot be parsed, or that parses but holds unusable values, is kept aside as `settings.json.invalid`, and the application loads the previous saved generation if there is one, or defaults if there is not. The window says which happened.
 
@@ -43,7 +45,15 @@ With a coordinator address set, the companion reads `GET /api/v1/night/session` 
 
 If the coordinator stops answering after it has answered once, the companion keeps the last Show Night state it observed and says it is holding. A coordinator outage in the middle of a night therefore leaves Resolume supervision armed. The hold ends when the coordinator answers again, when an operator sets an override, or when the address is changed. A coordinator that has never answered leaves the night unknown, which is disarmed. The held state is not saved, so a companion restart during an outage starts from unknown.
 
-The companion does not report anything back to the coordinator yet. ShowMesh cannot see whether the companion is running.
+## Sending crash reports
+
+Crash reports go to `POST /api/v1/companion-reports` on the coordinator, which needs a token. Issue one on the coordinator for a machine principal with the `companion` role, which can send reports and nothing else, then paste it into the Coordinator token field. Uploading needs a coordinator address, a token, and the Crash reports switch on; with any of those missing the module says which.
+
+The token is saved in `settings.json`, which is written readable only by the current user. It is never sent to the settings window: the window only learns whether one is saved, and leaving the field blank keeps the saved token. To remove it, tick Remove the saved token and save.
+
+Uploads are retried on the next scan when the coordinator cannot be reached. A token the coordinator rejects stops the scan and is reported until a new one is saved. A report the coordinator refuses as invalid or too large is not sent again.
+
+Apart from crash reports, the companion does not report to the coordinator. ShowMesh cannot see whether the companion is running.
 
 ## Development
 
