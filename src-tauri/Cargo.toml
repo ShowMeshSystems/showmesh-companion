@@ -27,3 +27,4 @@ sysinfo = "0.39"
 cpal = "0.15"
 ureq = { version = "2", features = ["json"] }
 sha2 = "0.10"
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
