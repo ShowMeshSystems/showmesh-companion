@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,11 @@ const REPORT_KIND: &str = "crash_report";
 const REPORT_SOURCE: &str = "resolume-arena";
 const DEFAULT_EXECUTABLE: &str = "Arena";
 const LEDGER_FILE: &str = "crash-reports.json";
+/// Arena's own crash handler (BugSplat) catches most crashes before macOS
+/// writes an `.ips` file, then saves its attachments here as one zip that is
+/// replaced on every crash.
+const BUGSPLAT_FOLDER: &str = "Library/Caches/com.resolume.arena";
+const BUGSPLAT_ARCHIVE: &str = "lastCrash.zip";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -151,8 +157,9 @@ pub fn report_folders() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
-    let base = PathBuf::from(home).join("Library/Logs/DiagnosticReports");
-    vec![base.join("Retired"), base]
+    let home = PathBuf::from(home);
+    let base = home.join("Library/Logs/DiagnosticReports");
+    vec![base.join("Retired"), base, home.join(BUGSPLAT_FOLDER)]
 }
 
 #[derive(Clone, Debug)]
@@ -181,7 +188,7 @@ fn list_candidates(folders: &[PathBuf], prefix: &str) -> Result<Vec<Candidate>, 
             let Ok(file_name) = entry.file_name().into_string() else {
                 continue;
             };
-            if !is_candidate(&file_name, prefix) {
+            if !is_candidate(&file_name, prefix) && file_name != BUGSPLAT_ARCHIVE {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
@@ -268,11 +275,32 @@ impl Ledger {
 
 type FileKey = (PathBuf, SystemTime, u64);
 
-/// Owns the ledger and a hash cache, so an unchanged file is hashed once.
+/// One uploadable report: a crash report file, or one entry of Arena's crash zip.
+struct Piece {
+    file_name: String,
+    sha256: String,
+    /// The text, or why it cannot be sent.
+    content: Result<String, String>,
+}
+
+impl Piece {
+    fn from_bytes(file_name: String, bytes: Vec<u8>) -> Self {
+        let sha256 = sha256_hex(&bytes);
+        let content = String::from_utf8(bytes).map_err(|_| "is not text".to_string());
+        Self {
+            file_name,
+            sha256,
+            content,
+        }
+    }
+}
+
+/// Owns the ledger and a hash cache, so a file whose reports are all finished
+/// is not read again until it changes.
 pub struct CrashReporter {
     directory: PathBuf,
     ledger: Ledger,
-    hashes: HashMap<FileKey, String>,
+    hashes: HashMap<FileKey, Vec<String>>,
     status: CrashReportStatus,
 }
 
@@ -339,7 +367,7 @@ impl CrashReporter {
 
         let mut attempts = 0;
         let mut stopped: Option<(CrashReportState, String)> = None;
-        for candidate in candidates {
+        'candidates: for candidate in candidates {
             if attempts >= UPLOADS_PER_SCAN {
                 break;
             }
@@ -350,69 +378,83 @@ impl CrashReporter {
                 ));
                 continue;
             }
-            let Some((sha256, content)) = self.read(&candidate) else {
-                continue;
-            };
-            if self.ledger.contains(&sha256) {
+            if self.is_finished(&candidate) {
                 continue;
             }
-            let Some(content) = content else {
-                self.ledger.record(
-                    &sha256,
-                    LedgerOutcome::Refused,
-                    &candidate.file_name,
-                    now_ms,
-                );
-                status.last_error = Some(format!(
-                    "{} is not text and was not sent.",
-                    candidate.file_name
-                ));
-                continue;
-            };
-            attempts += 1;
-            let report = Report {
-                file_name: &candidate.file_name,
-                captured_at: rfc3339_utc(candidate.modified),
-                sha256: &sha256,
-                content: &content,
-            };
-            match upload(&report) {
-                UploadOutcome::Accepted => {
-                    self.ledger.record(
-                        &sha256,
-                        LedgerOutcome::Accepted,
-                        &candidate.file_name,
-                        now_ms,
-                    );
-                    status.last_error = None;
-                }
-                UploadOutcome::Refused(why) => {
-                    self.ledger.record(
-                        &sha256,
-                        LedgerOutcome::Refused,
-                        &candidate.file_name,
-                        now_ms,
-                    );
+            let pieces = match self.read(&candidate) {
+                Ok(pieces) => pieces,
+                Err(error) => {
                     status.last_error = Some(format!(
-                        "{} was not stored because {why}.",
+                        "{} could not be read: {error}.",
                         candidate.file_name
                     ));
+                    continue;
                 }
-                UploadOutcome::TokenRejected => {
-                    stopped = Some((
-                        CrashReportState::TokenRejected,
-                        "The coordinator rejected the companion token. Paste a new companion token in settings.".into(),
-                    ));
-                    break;
+            };
+            for piece in pieces {
+                if attempts >= UPLOADS_PER_SCAN {
+                    break 'candidates;
                 }
-                UploadOutcome::Retry(why) => {
-                    stopped = Some((
-                        CrashReportState::CoordinatorUnreachable,
-                        format!(
-                            "Cannot send crash reports to the coordinator: {why}. They will be sent when it answers."
-                        ),
-                    ));
-                    break;
+                if self.ledger.contains(&piece.sha256) {
+                    continue;
+                }
+                let content = match piece.content {
+                    Ok(content) => content,
+                    Err(why) => {
+                        self.ledger.record(
+                            &piece.sha256,
+                            LedgerOutcome::Refused,
+                            &piece.file_name,
+                            now_ms,
+                        );
+                        status.last_error =
+                            Some(format!("{} {why} and was not sent.", piece.file_name));
+                        continue;
+                    }
+                };
+                attempts += 1;
+                let report = Report {
+                    file_name: &piece.file_name,
+                    captured_at: rfc3339_utc(candidate.modified),
+                    sha256: &piece.sha256,
+                    content: &content,
+                };
+                match upload(&report) {
+                    UploadOutcome::Accepted => {
+                        self.ledger.record(
+                            &piece.sha256,
+                            LedgerOutcome::Accepted,
+                            &piece.file_name,
+                            now_ms,
+                        );
+                        status.last_error = None;
+                    }
+                    UploadOutcome::Refused(why) => {
+                        self.ledger.record(
+                            &piece.sha256,
+                            LedgerOutcome::Refused,
+                            &piece.file_name,
+                            now_ms,
+                        );
+                        status.last_error =
+                            Some(format!("{} was not stored because {why}.", piece.file_name));
+                    }
+                    UploadOutcome::TokenRejected => {
+                        stopped = Some((
+                            CrashReportState::TokenRejected,
+                            "The coordinator rejected the companion token. Paste a new companion token in settings.".into(),
+                        ));
+                        break 'candidates;
+                    }
+                    UploadOutcome::Retry(why) => {
+                        stopped = Some((
+                            CrashReportState::CoordinatorUnreachable,
+                            format!(
+                                "Cannot send crash reports to the coordinator: {why}. They will be sent when it answers."
+                            ),
+                        ));
+                        break 'candidates;
+                    }
                 }
             }
         }
@@ -450,17 +492,69 @@ impl CrashReporter {
         (count, last)
     }
 
-    /// Returns the content hash and, when the bytes are UTF-8, the text.
-    fn read(&mut self, candidate: &Candidate) -> Option<(String, Option<String>)> {
-        let bytes = fs::read(&candidate.path).ok()?;
-        let key = (candidate.path.clone(), candidate.modified, candidate.len);
-        let sha256 = self
-            .hashes
-            .entry(key)
-            .or_insert_with(|| sha256_hex(&bytes))
-            .clone();
-        Some((sha256, String::from_utf8(bytes).ok()))
+    /// True when this unchanged file was read before and every report in it
+    /// was accepted or refused.
+    fn is_finished(&self, candidate: &Candidate) -> bool {
+        self.hashes
+            .get(&file_key(candidate))
+            .is_some_and(|hashes| hashes.iter().all(|sha256| self.ledger.contains(sha256)))
     }
+
+    /// Reads a crash report file as one report, or Arena's crash zip as one
+    /// report per entry.
+    fn read(&mut self, candidate: &Candidate) -> Result<Vec<Piece>, String> {
+        let bytes = fs::read(&candidate.path).map_err(|error| error.to_string())?;
+        let pieces = if candidate.file_name == BUGSPLAT_ARCHIVE {
+            archive_pieces(bytes)?
+        } else {
+            vec![Piece::from_bytes(candidate.file_name.clone(), bytes)]
+        };
+        self.hashes.insert(
+            file_key(candidate),
+            pieces.iter().map(|piece| piece.sha256.clone()).collect(),
+        );
+        Ok(pieces)
+    }
+}
+
+fn file_key(candidate: &Candidate) -> FileKey {
+    (candidate.path.clone(), candidate.modified, candidate.len)
+}
+
+/// Splits Arena's crash zip into its files. An entry over 4 MB is read only up
+/// to the limit, so a damaged or hostile zip cannot exhaust memory.
+fn archive_pieces(bytes: Vec<u8>) -> Result<Vec<Piece>, String> {
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| error.to_string())?;
+    let mut pieces = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
+        if !entry.is_file() {
+            continue;
+        }
+        let Some(file_name) = entry.enclosed_name().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        }) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        (&mut entry)
+            .take(MAX_CONTENT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > MAX_CONTENT_BYTES {
+            let sha256 = sha256_hex(&bytes);
+            pieces.push(Piece {
+                file_name,
+                sha256,
+                content: Err("is larger than 4 MB".into()),
+            });
+            continue;
+        }
+        pieces.push(Piece::from_bytes(file_name, bytes));
+    }
+    Ok(pieces)
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -767,6 +861,123 @@ mod tests {
                 UploadOutcome::Accepted
             });
             assert_eq!(calls, UPLOADS_PER_SCAN);
+        }
+
+        fn write_bugsplat_zip(folder: &Path, entries: &[(&str, &[u8])]) {
+            use std::io::Write;
+            let file = fs::File::create(folder.join(BUGSPLAT_ARCHIVE)).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            for (name, bytes) in entries {
+                writer
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        #[test]
+        fn arenas_crash_zip_is_sent_one_report_per_entry() {
+            let state_dir = temp_dir();
+            let cache = temp_dir();
+            write_bugsplat_zip(
+                &cache,
+                &[
+                    ("lastCrash.log", b"log of the first crash"),
+                    ("lastCrash.mem.txt", b"Max MB: 512"),
+                    ("lastCrash.additional_recentLayout.xml", b"<layout/>"),
+                ],
+            );
+            let mut sent = Vec::new();
+            let mut reporter = CrashReporter::new(state_dir.clone());
+            let status = reporter.scan(&config(), std::slice::from_ref(&cache), 1, &mut |report| {
+                sent.push((report.file_name.to_string(), report.content.to_string()));
+                UploadOutcome::Accepted
+            });
+            assert_eq!(
+                sent,
+                vec![
+                    (
+                        "lastCrash.log".to_string(),
+                        "log of the first crash".to_string()
+                    ),
+                    ("lastCrash.mem.txt".to_string(), "Max MB: 512".to_string()),
+                    (
+                        "lastCrash.additional_recentLayout.xml".to_string(),
+                        "<layout/>".to_string()
+                    ),
+                ]
+            );
+            assert_eq!(status.sent_count, 3);
+
+            reporter.scan(&config(), std::slice::from_ref(&cache), 2, &mut |_| {
+                panic!("an unchanged crash zip was sent again")
+            });
+
+            // The next crash replaces the zip under the same name. Only entries
+            // whose content changed are new reports.
+            write_bugsplat_zip(
+                &cache,
+                &[
+                    ("lastCrash.log", b"log of the second crash"),
+                    ("lastCrash.mem.txt", b"Max MB: 512"),
+                    ("lastCrash.additional_recentLayout.xml", b"<layout/>"),
+                ],
+            );
+            let mut sent = Vec::new();
+            CrashReporter::new(state_dir).scan(&config(), &[cache], 3, &mut |report| {
+                sent.push(report.content.to_string());
+                UploadOutcome::Accepted
+            });
+            assert_eq!(sent, vec!["log of the second crash"]);
+        }
+
+        #[test]
+        fn a_damaged_crash_zip_is_reported_and_retried() {
+            let cache = temp_dir();
+            fs::write(cache.join(BUGSPLAT_ARCHIVE), b"not a zip").unwrap();
+            let mut reporter = CrashReporter::new(temp_dir());
+            let status = reporter.scan(&config(), std::slice::from_ref(&cache), 1, &mut |_| {
+                panic!("nothing should be sent from a damaged zip")
+            });
+            assert_eq!(status.state, CrashReportState::Watching);
+            assert!(
+                status
+                    .last_error
+                    .unwrap()
+                    .contains("lastCrash.zip could not be read")
+            );
+
+            write_bugsplat_zip(&cache, &[("lastCrash.log", b"written in full")]);
+            let mut calls = 0;
+            reporter.scan(&config(), &[cache], 2, &mut |_| {
+                calls += 1;
+                UploadOutcome::Accepted
+            });
+            assert_eq!(calls, 1);
+        }
+
+        #[test]
+        fn a_crash_zip_entry_that_is_not_text_is_refused_once() {
+            let cache = temp_dir();
+            write_bugsplat_zip(
+                &cache,
+                &[
+                    ("lastCrash.bin", &[0xff, 0xfe, 0x00]),
+                    ("lastCrash.log", b"text"),
+                ],
+            );
+            let mut sent = Vec::new();
+            let mut reporter = CrashReporter::new(temp_dir());
+            let status = reporter.scan(&config(), std::slice::from_ref(&cache), 1, &mut |report| {
+                sent.push(report.file_name.to_string());
+                UploadOutcome::Accepted
+            });
+            assert_eq!(sent, vec!["lastCrash.log"]);
+            assert_eq!(status.sent_count, 1);
+            reporter.scan(&config(), &[cache], 2, &mut |_| {
+                panic!("a finished crash zip was sent again")
+            });
         }
 
         #[test]
